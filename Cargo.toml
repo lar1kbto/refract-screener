@@ -2,6 +2,7 @@
 name = "refract-screener"
 version = "1.1.5"
 edition = "2021"
+license = "MIT"
 description = "Refract-screener: screenshot tool for Windows 11 that replaces Snipping Tool"
 
 [[bin]]

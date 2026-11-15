@@ -163,3 +163,7 @@ Self-test (capture, every tool, a lossless round trip of every format, OCR and t
 ```
 refract-screener.exe --selftest <folder>
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). The Refract name and logo are not covered by the license.
