@@ -197,11 +197,12 @@ fn main() {
                 let _ = PostMessageW(h, WM_APP_REMOTE, WPARAM(link_action.unwrap()), LPARAM(0));
             },
             Some(h) if !has("--background") => {
-                let a = action.unwrap_or(hotkey::Action::Region);
-                log(&format!("second instance: asking {:?} to run {:?}", h.0, a));
+                // A capture flag captures; a plain launch (Start menu, the EXE) opens Settings.
+                let code = action.map(|a| a as usize).unwrap_or(REMOTE_SHOW_SETTINGS);
+                log(&format!("second instance: asking {:?} for {code}", h.0));
                 unsafe {
                     let _ = AllowSetForegroundWindow(ASFW_ANY);
-                    let _ = PostMessageW(h, WM_APP_REMOTE, WPARAM(a as usize), LPARAM(0));
+                    let _ = PostMessageW(h, WM_APP_REMOTE, WPARAM(code), LPARAM(0));
                 }
             }
             Some(_) => {}
@@ -289,13 +290,7 @@ fn main() {
     } else if has("--welcome") {
         notify(
             "Refract-screener is ready",
-            "PrintScreen or Win+Shift+S to capture. Right-click the tray icon for settings.",
-            false,
-        );
-    } else if !has("--background") && action.is_none() && link_action.is_none() {
-        notify(
-            "Refract-screener is running",
-            "PrintScreen or Win+Shift+S to capture.",
+            "PrintScreen or Win+Shift+S to capture. Settings: click the tray icon or open Refract-screener from Start.",
             false,
         );
     }
@@ -305,7 +300,8 @@ fn main() {
         }
     }
 
-    if link_action == Some(REMOTE_SHOW_SETTINGS) {
+    let plain_start = !has("--background") && action.is_none() && link_action.is_none();
+    if link_action == Some(REMOTE_SHOW_SETTINGS) || plain_start {
         settings::show();
     }
     if app(|a| a.cfg.auto_update).unwrap_or(true) {
@@ -384,7 +380,7 @@ fn tray_data(a: &App) -> NOTIFYICONDATAW {
         hIcon: a.icon,
         ..Default::default()
     };
-    let tip = wide("Refract-screener  -  PrintScreen to capture");
+    let tip = wide("Refract-screener  -  click for settings, PrintScreen to capture");
     let n = tip.len().min(nid.szTip.len() - 1);
     nid.szTip[..n].copy_from_slice(&tip[..n]);
     nid
@@ -1358,7 +1354,7 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             let ev = (lp.0 & 0xFFFF) as u32;
             match ev {
                 WM_CONTEXTMENU | WM_RBUTTONUP => show_menu(),
-                NIN_SELECT | 0x401 | WM_LBUTTONUP => start_capture(hotkey::Action::Region),
+                NIN_SELECT | 0x401 | WM_LBUTTONUP => settings::show(),
                 NIN_BALLOONUSERCLICK => {
                     if let Some(p) = app(|a| a.last_saved.clone()).flatten() {
                         shell_select(&p);
@@ -1372,6 +1368,10 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             let _ = KillTimer(h, TIMER_DELAY);
             start_capture(hotkey::Action::Region);
             LRESULT(0)
+        }
+        WM_POWERBROADCAST if wp.0 == 0x12 /* PBT_APMRESUMEAUTOMATIC */ => {
+            let _ = SetTimer(h, update::TIMER_CHECK, 30_000, None);
+            LRESULT(1)
         }
         WM_CLOSE => {
             PostQuitMessage(0);

@@ -350,7 +350,11 @@ pub fn preview(
     if let Some(r) = ocr {
         // Select the first paragraph (lines 1..=3), like a drag over it.
         let a = r.lines.get(1).map(|l| l.first_word).unwrap_or(0);
-        let b = r.lines.get(3).map(|l| l.first_word + l.word_count - 1).unwrap_or(r.words.len().saturating_sub(1));
+        let b = r
+            .lines
+            .get(3)
+            .map(|l| l.first_word + l.word_count - 1)
+            .unwrap_or(r.words.len().saturating_sub(1));
         o.ocr.result = Some(r);
         o.ocr.for_sel = Some(sel);
         o.ocr.mode = true;

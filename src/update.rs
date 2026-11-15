@@ -1,4 +1,4 @@
-//! Auto-update. On start (and every few hours) the app quietly asks the update server (`update_url`)
+//! Auto-update. On start, every hour and after the PC wakes up, the app quietly asks the update server (`update_url`)
 //! for the current version. A newer build is downloaded in the background while a
 //! small card in the corner shows the progress; when it is verified (size + SHA-256)
 //! the card and a notification offer "Restart now". Restarting swaps the EXE
@@ -21,7 +21,7 @@ pub const WM_APP_UPD_PROGRESS: u32 = WM_APP + 41;
 pub const WM_APP_UPD_READY: u32 = WM_APP + 42; // lparam = Box<(String, PathBuf)>
 pub const WM_APP_UPD_NONE: u32 = WM_APP + 43; // lparam = Box<Option<String>> error
 pub const TIMER_CHECK: usize = 31;
-pub const CHECK_EVERY_MS: u32 = 6 * 3600 * 1000;
+pub const CHECK_EVERY_MS: u32 = 3600 * 1000;
 
 pub fn current() -> &'static str {
     env!("CARGO_PKG_VERSION")

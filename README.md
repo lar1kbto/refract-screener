@@ -94,7 +94,7 @@ In the editor:
 
 ## Settings
 
-Open them from the tray icon (**Settings…**) or by running `refract-screener.exe --settings`. The window covers:
+Open them by clicking the tray icon, or by opening Refract-screener from the Start menu. Settings also open right after installing. The window covers:
 
 - the screenshot folder;
 - the format;
@@ -124,7 +124,7 @@ set REFRACT_UPDATE_URL=https://your.server
 cargo build --release
 ```
 
-The app checks `GET {server}/api/screens/manifest` on start and then every 6 hours. The manifest looks like this:
+The app checks `GET {server}/api/screens/manifest` on start, every hour and after the PC wakes up. The manifest looks like this:
 
 ```json
 {
