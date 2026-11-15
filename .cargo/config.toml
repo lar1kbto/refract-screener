@@ -1,0 +1,8 @@
+# Link the C runtime statically: the EXEs run on a clean Windows 10/11 without the VC++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Optional: the server the app updates from and the installer downloads from.
+# Without it the build has no auto-update. See README, "Updates".
+# [env]
+# REFRACT_UPDATE_URL = "https://example.com"
