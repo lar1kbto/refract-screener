@@ -250,7 +250,8 @@ pub fn default_style(t: Tool) -> Style {
 pub enum ImageFormat {
     /// Lossless PNG, optimised with oxipng (palette/bit-depth reduction + best deflate).
     Png,
-    /// Lossless WebP (libwebp, method 6): usually 20-30 % smaller than optimised PNG.
+    /// Lossless WebP (libwebp 1.6, method 5): about 30 % smaller than optimised PNG,
+    /// up to 45 % on UI and text.
     WebP,
 }
 

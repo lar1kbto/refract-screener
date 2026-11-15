@@ -371,6 +371,11 @@ pub fn preview(
     Ok(())
 }
 
+/// Long enough to read: 2.6 s, longer for long messages.
+fn toast_time(text: &str) -> Duration {
+    Duration::from_millis((text.chars().count() as u64 * 70).max(2600))
+}
+
 fn render_to(o: &mut Overlay, path: &std::path::Path) -> Result<()> {
     use windows::Win32::Graphics::Imaging::*;
     use windows::Win32::System::Com::*;
@@ -741,34 +746,14 @@ impl Overlay {
             .unwrap_or(self.shot.full())
     }
 
+    /// The word under `q`; with `nearest`, the word a caret at `q` stands for.
     fn word_at(&self, q: P, nearest: bool) -> Option<usize> {
         let res = self.ocr.result.as_ref()?;
-        if let Some(i) = res
-            .words
-            .iter()
-            .position(|w| w.rect.inflate(3.0).contains(q))
-        {
-            return Some(i);
+        if nearest {
+            ocr::caret(res, q)
+        } else {
+            ocr::word_at(res, q)
         }
-        if !nearest {
-            return None;
-        }
-        // Nearest word, preferring the line under the pointer.
-        res.words
-            .iter()
-            .enumerate()
-            .min_by(|a, b| {
-                let d = |w: &ocr::Word| {
-                    let r = w.rect;
-                    let dx = (r.l - q.x).max(0.0).max(q.x - r.r);
-                    let dy = (r.t - q.y).max(0.0).max(q.y - r.b);
-                    dx + dy * 4.0
-                };
-                d(a.1)
-                    .partial_cmp(&d(b.1))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
     }
 
     // ---------------------------------------------------------------- OCR / translation
@@ -826,6 +811,12 @@ impl Overlay {
             self.toast(e.clone(), true);
         } else if (self.ocr.mode || self.tr.on) && r.words.is_empty() {
             self.toast("No text found in the selection", false);
+        } else if let Some(h) = r.hint.as_ref().filter(|_| self.ocr.mode || self.tr.on) {
+            // Once per run: the advice does not change between captures.
+            static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                self.toast(h.clone(), false);
+            }
         }
         self.ocr.result = Some(r);
         if self.tr.on {
@@ -913,32 +904,13 @@ impl Overlay {
                 .collect::<Vec<_>>()
                 .join("\n");
         }
-        let (a, b) = match (self.ocr.range, all) {
-            (Some((a, b)), false) => (a.min(b), a.max(b)),
-            _ => (0, res.words.len().saturating_sub(1)),
-        };
         if res.words.is_empty() {
             return String::new();
         }
-        let mut out: Vec<String> = Vec::new();
-        for (li, line) in res.lines.iter().enumerate() {
-            let lo = line.first_word;
-            let hi = line.first_word + line.word_count;
-            if hi <= a || lo > b {
-                continue;
-            }
-            if lo >= a && hi - 1 <= b {
-                out.push(line.text.clone());
-            } else {
-                let words: Vec<&str> = res.words[lo.max(a)..hi.min(b + 1)]
-                    .iter()
-                    .filter(|w| w.line == li)
-                    .map(|w| w.text.as_str())
-                    .collect();
-                out.push(words.join(" "));
-            }
+        match (self.ocr.range, all) {
+            (Some((a, b)), false) => ocr::text_range(res, a, b),
+            _ => ocr::text_range(res, 0, res.words.len() - 1),
         }
-        out.join("\n")
     }
 
     fn copy_text(&mut self) {
@@ -1214,7 +1186,7 @@ impl Overlay {
                 let toast_alive = self
                     .toast
                     .as_ref()
-                    .is_some_and(|t| t.1.elapsed() < Duration::from_millis(2600));
+                    .is_some_and(|t| t.1.elapsed() < toast_time(&t.0));
                 if !toast_alive {
                     self.toast = None;
                 }
@@ -2375,9 +2347,7 @@ impl Overlay {
 
     fn draw_toast(&self, rt: &ID2D1RenderTarget, s: f32) -> Result<()> {
         let (text, err) = match (&self.toast, self.ocr.busy, self.tr.busy) {
-            (Some((t, at, e)), _, _) if at.elapsed() < Duration::from_millis(2600) => {
-                (t.clone(), *e)
-            }
+            (Some((t, at, e)), _, _) if at.elapsed() < toast_time(t) => (t.clone(), *e),
             (_, true, _) => ("Recognising text...".to_string(), false),
             (_, _, true) => (
                 format!("Translating to {}...", self.tr.target.to_uppercase()),

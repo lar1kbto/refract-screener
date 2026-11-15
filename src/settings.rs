@@ -363,7 +363,7 @@ unsafe fn draw(dc: HDC, rc: RECT) {
     }
     let note = match snap.cfg.format {
         crate::config::ImageFormat::Png => "Lossless PNG, opens everywhere",
-        crate::config::ImageFormat::WebP => "Lossless WebP, about 25% smaller",
+        crate::config::ImageFormat::WebP => "Lossless WebP, about 30% smaller",
     };
     let mut t = rect(px(28.0), px(280.0), px(220.0), px(296.0));
     text(

@@ -130,6 +130,27 @@ fn main() {
         };
         std::process::exit(demo_shots(PathBuf::from(dir), PathBuf::from(bg)));
     }
+    if has("--ocr-test") {
+        let rest: Vec<String> = args
+            .iter()
+            .skip_while(|a| !a.eq_ignore_ascii_case("--ocr-test"))
+            .skip(1)
+            .cloned()
+            .collect();
+        let dir = PathBuf::from(rest.first().map(String::as_str).unwrap_or("."));
+        let lang = rest.get(1).cloned().unwrap_or_default();
+        let code = std::thread::spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::WinRT::RoInitialize(
+                    windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+                );
+            }
+            ocr::ocr_test(&dir, &lang, load_png)
+        })
+        .join()
+        .unwrap_or(101);
+        std::process::exit(code);
+    }
     if has("--guard") {
         guard::run();
         return;
@@ -1556,14 +1577,14 @@ fn selftest(dir: PathBuf) -> i32 {
         let t = std::time::Instant::now();
         let data = encode::webp(img).unwrap();
         let ms = t.elapsed().as_millis();
-        let ok = webp::Decoder::new(&data)
-            .decode()
-            .map(|d| {
-                let px: &[u8] = &d;
-                let ch = if d.is_alpha() { 4 } else { 3 };
-                px.chunks_exact(ch)
-                    .zip(img.bgra.chunks_exact(4))
-                    .all(|(a, b)| a[0] == b[2] && a[1] == b[1] && a[2] == b[0])
+        let ok = encode::webp_decode_rgb(&data)
+            .map(|(w, h, px)| {
+                w == img.w
+                    && h == img.h
+                    && px
+                        .chunks_exact(3)
+                        .zip(img.bgra.chunks_exact(4))
+                        .all(|(a, b)| a[0] == b[2] && a[1] == b[1] && a[2] == b[0])
             })
             .unwrap_or(false);
         if !ok {

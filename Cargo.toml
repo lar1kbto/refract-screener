@@ -1,6 +1,6 @@
 ﻿[package]
 name = "refract-screener"
-version = "1.1.5"
+version = "1.1.6"
 edition = "2021"
 license = "MIT"
 description = "Refract-screener: screenshot tool for Windows 11 that replaces Snipping Tool"
@@ -20,12 +20,13 @@ winresource = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 oxipng = { version = "10", default-features = false, features = ["parallel"] }
-webp = { version = "0.3", default-features = false }
+libwebp-sys = "0.14.4"
 
 [dependencies.windows]
 version = "0.58"
 features = [
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
@@ -62,6 +63,7 @@ features = [
   "Graphics_Imaging",
   "Media_Ocr",
   "Storage_Streams",
+  "System_UserProfile",
   "Web_Http",
   "Web_Http_Headers",
   "UI_Notifications",

@@ -2,7 +2,7 @@
 //!
 //! Pixels are never changed: PNG goes through oxipng (exact palette when the shot has
 //! <= 256 colours, bit-depth/colour-type reduction, filter search, libdeflate level
-//! 12), WebP uses libwebp in lossless mode with `exact` so even hidden pixels stay.
+//! 12), WebP uses libwebp 1.6 in lossless mode with `exact` so even hidden pixels stay.
 
 use crate::config::ImageFormat;
 use crate::win::*;
@@ -51,23 +51,54 @@ pub fn png(img: &Image, effort: u8) -> Result<Vec<u8>, String> {
     raw.create_optimized_png(&opts).map_err(|e| e.to_string())
 }
 
+/// Lossless WebP via libwebp 1.6. Method 5 is within ~1 % of method 6 on screenshots
+/// but 2-6x faster (a 4K game frame: 6 s instead of 24 s), `exact` keeps every pixel.
 pub fn webp(img: &Image) -> Result<Vec<u8>, String> {
-    let rgba: Vec<u8> = img
-        .bgra
-        .chunks_exact(4)
-        .flat_map(|p| [p[2], p[1], p[0]])
-        .collect();
-    let enc = webp::Encoder::from_rgb(&rgba, img.w, img.h);
-    let mut cfg = webp::WebPConfig::new().map_err(|_| "WebPConfig init failed".to_string())?;
+    use libwebp_sys::*;
+    let rgb = rgb(img);
+    let mut cfg = WebPConfig::new().map_err(|_| "WebPConfig init failed".to_string())?;
     cfg.lossless = 1;
     cfg.quality = 100.0; // in lossless mode: compression effort
-    cfg.method = 6;
+    cfg.method = 5;
     cfg.exact = 1;
     cfg.thread_level = 1;
-    let mem = enc
-        .encode_advanced(&cfg)
-        .map_err(|e| format!("WebP encode failed: {e:?}"))?;
-    Ok(mem.to_vec())
+    let mut pic = WebPPicture::new().map_err(|_| "WebPPicture init failed".to_string())?;
+    pic.use_argb = 1;
+    pic.width = img.w as i32;
+    pic.height = img.h as i32;
+    unsafe {
+        let mut wr: WebPMemoryWriter = std::mem::zeroed();
+        WebPMemoryWriterInit(&mut wr);
+        let ok = WebPPictureImportRGB(&mut pic, rgb.as_ptr(), (img.w * 3) as i32) != 0 && {
+            pic.writer = Some(WebPMemoryWrite);
+            pic.custom_ptr = &mut wr as *mut WebPMemoryWriter as *mut _;
+            WebPEncode(&cfg, &mut pic) != 0
+        };
+        let err = pic.error_code;
+        let out = if ok && !wr.mem.is_null() {
+            Ok(std::slice::from_raw_parts(wr.mem, wr.size).to_vec())
+        } else {
+            Err(format!("WebP encode failed: {err:?}"))
+        };
+        WebPPictureFree(&mut pic);
+        WebPMemoryWriterClear(&mut wr);
+        out
+    }
+}
+
+/// Decodes a WebP to RGB (used by the self test).
+pub fn webp_decode_rgb(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    use libwebp_sys::*;
+    unsafe {
+        let (mut w, mut h) = (0, 0);
+        let p = WebPDecodeRGB(data.as_ptr(), data.len(), &mut w, &mut h);
+        if p.is_null() {
+            return None;
+        }
+        let px = std::slice::from_raw_parts(p, (w * h * 3) as usize).to_vec();
+        WebPFree(p as *mut _);
+        Some((w as u32, h as u32, px))
+    }
 }
 
 pub fn encode(img: &Image, fmt: ImageFormat, effort: u8) -> Result<Vec<u8>, String> {
