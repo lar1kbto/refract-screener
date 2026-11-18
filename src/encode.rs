@@ -127,15 +127,6 @@ pub struct SaveError {
     pub blocked: bool,
 }
 
-pub fn save(img: &Image, path: &Path, effort: u8) -> Result<u64, SaveError> {
-    let data = encode(img, format_for(path), effort).map_err(|msg| SaveError {
-        msg,
-        blocked: false,
-    })?;
-    write(path, &data)?;
-    Ok(data.len() as u64)
-}
-
 pub fn write(path: &Path, data: &[u8]) -> Result<(), SaveError> {
     let io = |e: std::io::Error| SaveError {
         blocked: matches!(e.raw_os_error(), Some(2) | Some(5)),

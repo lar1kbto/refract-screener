@@ -60,9 +60,18 @@ fn transpose(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
     });
 }
 
+fn box_radius(radius: u32) -> usize {
+    ((radius as f32) * 0.58).round().max(1.0) as usize
+}
+
+/// How many pixels away a blurred pixel still reads from (three box passes).
+pub fn blur_reach(radius: u32) -> usize {
+    3 * box_radius(radius) + 1
+}
+
 /// Gaussian-like blur (three box passes each way). `radius` in pixels.
 pub fn blur(src: &[u8], w: usize, h: usize, radius: u32) -> Vec<u8> {
-    let r = ((radius as f32) * 0.58).round().max(1.0) as usize;
+    let r = box_radius(radius);
     let mut a = src.to_vec();
     let mut b = vec![0u8; a.len()];
     for _ in 0..3 {

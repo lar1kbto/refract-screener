@@ -193,6 +193,15 @@ impl Fill {
     }
 }
 
+/// Alignment of the lines of a text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Style {
@@ -201,6 +210,10 @@ pub struct Style {
     pub opacity: f32,
     pub fill: Fill,
     pub shadow: bool,
+    /// Text only: line alignment, bold and italic.
+    pub align: Align,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 impl Default for Style {
@@ -211,6 +224,9 @@ impl Default for Style {
             opacity: 1.0,
             fill: Fill::None,
             shadow: true,
+            align: Align::Left,
+            bold: true,
+            italic: false,
         }
     }
 }
@@ -273,6 +289,8 @@ pub struct Config {
     pub hotkey_fullscreen: Vec<String>,
     /// Instantly capture the active window (no overlay).
     pub hotkey_window: Vec<String>,
+    /// Select an area, then the app scrolls it and stitches one long screenshot.
+    pub hotkey_scroll: Vec<String>,
 
     pub format: ImageFormat,
     /// oxipng effort 0..6 (higher = smaller file, slower). 6 also tries Zopfli-like effort.
@@ -322,6 +340,7 @@ impl Default for Config {
             hotkey_region: vec!["PrintScreen".into(), "Win+Shift+S".into()],
             hotkey_fullscreen: vec!["Ctrl+PrintScreen".into()],
             hotkey_window: vec!["Alt+PrintScreen".into()],
+            hotkey_scroll: vec!["Ctrl+Shift+PrintScreen".into()],
             format: ImageFormat::Png,
             png_effort: 4,
             save_dir: String::new(),

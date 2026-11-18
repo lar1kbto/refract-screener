@@ -18,6 +18,7 @@ mod export;
 mod gdi;
 mod geom;
 mod guard;
+mod history;
 mod hotkey;
 mod icon;
 mod install;
@@ -25,8 +26,10 @@ mod net;
 mod ocr;
 mod overlay;
 mod paint;
+mod scroll;
 mod settings;
 mod shapes;
+mod share;
 mod toast;
 mod update;
 mod win;
@@ -61,6 +64,8 @@ struct SaveNote {
     body: String,
     path: Option<PathBuf>,
     blocked: bool,
+    /// The shot for the history (saved or being shared).
+    entry: Option<history::Entry>,
 }
 
 /// Windows Security > Ransomware protection > Controlled folder access blocks
@@ -117,6 +122,15 @@ fn main() {
             .cloned()
             .unwrap_or_else(|| ".".into());
         std::process::exit(selftest(PathBuf::from(dir)));
+    }
+    if has("--ui-shots") {
+        let dir = args
+            .iter()
+            .skip_while(|a| !a.eq_ignore_ascii_case("--ui-shots"))
+            .nth(1)
+            .cloned()
+            .unwrap_or_else(|| ".".into());
+        std::process::exit(ui_shots(PathBuf::from(dir)));
     }
     if has("--demo-shots") {
         let rest: Vec<String> = args
@@ -194,8 +208,10 @@ fn main() {
         Some("refract-screener:show-update") => Some(REMOTE_SHOW_UPDATE),
         Some("refract-screener:settings") => Some(REMOTE_SHOW_SETTINGS),
         Some("refract-screener:check-update") => Some(REMOTE_CHECK_UPDATE),
+        Some("refract-screener:history") => Some(REMOTE_SHOW_HISTORY),
         Some(_) => Some(0),
         None if has("--settings") => Some(REMOTE_SHOW_SETTINGS),
+        None if has("--history") => Some(REMOTE_SHOW_HISTORY),
         None => None,
     };
     let action = if has("--fullscreen") {
@@ -204,6 +220,8 @@ fn main() {
         Some(hotkey::Action::Window)
     } else if has("--capture") {
         Some(hotkey::Action::Region)
+    } else if has("--scroll") {
+        Some(hotkey::Action::Scroll)
     } else {
         None
     };
@@ -324,6 +342,9 @@ fn main() {
     let plain_start = !has("--background") && action.is_none() && link_action.is_none();
     if link_action == Some(REMOTE_SHOW_SETTINGS) || plain_start {
         settings::show();
+    }
+    if link_action == Some(REMOTE_SHOW_HISTORY) {
+        history::show();
     }
     if app(|a| a.cfg.auto_update).unwrap_or(true) {
         unsafe {
@@ -473,6 +494,7 @@ const REMOTE_APPLY_UPDATE: usize = 10;
 const REMOTE_SHOW_UPDATE: usize = 11;
 const REMOTE_SHOW_SETTINGS: usize = 12;
 const REMOTE_CHECK_UPDATE: usize = 13;
+const REMOTE_SHOW_HISTORY: usize = 14;
 
 fn wait_for_exit(pid: u32) {
     use windows::Win32::System::Threading::*;
@@ -538,6 +560,7 @@ pub mod menu_id {
     pub const CAPTURE: usize = 1;
     pub const FULL: usize = 2;
     pub const DELAY: usize = 3;
+    pub const SCROLL: usize = 4;
     pub const OPEN_DIR: usize = 10;
     pub const CHANGE_DIR: usize = 11;
     pub const RESET_DIR: usize = 12;
@@ -565,6 +588,8 @@ pub mod menu_id {
     pub const CHECK_UPDATE: usize = 80;
     pub const APPLY_UPDATE: usize = 81;
     pub const AUTO_UPDATE: usize = 82;
+    pub const HISTORY: usize = 200;
+    pub const SHARE_LAST: usize = 201;
 }
 
 fn show_menu() {
@@ -594,11 +619,29 @@ fn show_menu() {
         use menu_id::*;
         add(m, SETTINGS, "Settings...", false, true);
         sep(m);
-        add(m, CAPTURE, "Capture region\tPrintScreen", false, true);
+        let keys = |a: hotkey::Action| {
+            hotkey::first_label(&cfg, a)
+                .map(|k| format!("\t{k}"))
+                .unwrap_or_default()
+        };
+        add(
+            m,
+            CAPTURE,
+            &format!("Capture region{}", keys(hotkey::Action::Region)),
+            false,
+            true,
+        );
         add(
             m,
             FULL,
-            "Capture full screen\tCtrl+PrintScreen",
+            &format!("Capture full screen{}", keys(hotkey::Action::Fullscreen)),
+            false,
+            true,
+        );
+        add(
+            m,
+            SCROLL,
+            &format!("Scrolling capture{}", keys(hotkey::Action::Scroll)),
             false,
             true,
         );
@@ -640,6 +683,16 @@ fn show_menu() {
         );
         sub(m, folder, "Screenshot folder");
         add(m, OPEN_DIR, "Open screenshots", false, true);
+        add(m, HISTORY, "History...", false, true);
+        if share::enabled(&cfg) {
+            add(
+                m,
+                SHARE_LAST,
+                "Share last screenshot",
+                false,
+                history::last().is_some(),
+            );
+        }
         sep(m);
 
         let fmt = CreatePopupMenu().unwrap_or_default();
@@ -841,8 +894,19 @@ fn on_menu(id: usize) {
     let hwnd = app(|a| a.hwnd).unwrap_or_default();
     match id {
         SETTINGS => settings::show(),
+        HISTORY => history::show(),
+        SHARE_LAST => {
+            if !history::last().is_some_and(|e| history::share(hwnd, e.id)) {
+                notify(
+                    "Nothing to share",
+                    "The last screenshot is no longer on this PC.",
+                    true,
+                );
+            }
+        }
         CAPTURE => start_capture(hotkey::Action::Region),
         FULL => start_capture(hotkey::Action::Fullscreen),
+        SCROLL => start_capture(hotkey::Action::Scroll),
         DELAY => {
             let secs = app(|a| a.cfg.delay_seconds).unwrap_or(3).clamp(1, 60);
             unsafe {
@@ -1068,9 +1132,16 @@ fn save_dialog(
 
 // ---------------------------------------------------------------- capture flow
 
+/// Settings changed the shortcuts of `action`: save and apply them at once, here
+/// and in the key guard.
+pub fn set_hotkeys(action: hotkey::Action, keys: Vec<String>) {
+    update_cfg(|c| *action.keys_mut(c) = keys);
+    apply_hotkeys();
+}
+
 fn start_capture(action: hotkey::Action) {
-    if overlay::is_open() {
-        log("capture ignored: overlay already open");
+    if overlay::is_open() || scroll::is_running() {
+        log("capture ignored: overlay or scrolling capture already open");
         return;
     }
     log(&format!("capture {action:?}"));
@@ -1095,8 +1166,9 @@ fn start_capture(action: hotkey::Action) {
         }
     };
     match action {
-        hotkey::Action::Region => {
-            if let Err(e) = overlay::open(hwnd, cfg, shot) {
+        hotkey::Action::Region | hotkey::Action::Scroll => {
+            let pick = action == hotkey::Action::Scroll;
+            if let Err(e) = overlay::open(hwnd, cfg, shot, pick) {
                 log(&format!("overlay failed: {e}"));
                 notify("Cannot open the capture window", &e.message(), true);
             }
@@ -1141,10 +1213,20 @@ fn on_overlay_done() {
         c.translate_to = lang;
     });
     if let Some(d) = done {
+        if let overlay::Finish::Scroll(area) = d.how {
+            if let Some(cfg) = app(|a| a.cfg.clone()) {
+                scroll::start(hwnd_main(), cfg, area);
+            }
+            return;
+        }
         if let Some(img) = d.image {
             deliver(img, d.how);
         }
     }
+}
+
+fn hwnd_main() -> HWND {
+    app(|a| a.hwnd).unwrap_or_default()
 }
 
 fn deliver(img: encode::Image, how: overlay::Finish) {
@@ -1155,7 +1237,16 @@ fn deliver(img: encode::Image, how: overlay::Finish) {
     if how == Finish::Cancel {
         return;
     }
-    let copy = how == Finish::Copy || cfg.copy_to_clipboard;
+    // Share link needs a server; without one it is a plain save.
+    let share_base = share::base(&cfg);
+    let share = how == Finish::Share && share_base.is_some();
+    let how = if how == Finish::Share && !share {
+        Finish::Save
+    } else {
+        how
+    };
+    // Sharing puts the link on the clipboard, not the picture.
+    let copy = !share && (how == Finish::Copy || cfg.copy_to_clipboard);
     let copied = if copy {
         let png = encode::png(&img, 1).ok();
         encode::copy_image(hwnd, &img, png.as_deref())
@@ -1171,16 +1262,22 @@ fn deliver(img: encode::Image, how: overlay::Finish) {
         _ if cfg.auto_save => Some(unique_path(&dir, &name, cfg.format.ext())),
         _ => None,
     };
-    if path.is_none() && !copied {
+    if path.is_none() && !copied && !share {
         return;
     }
 
     // Feedback right away, like Snipping Tool; the lossless file is written meanwhile.
-    if path.is_some() && cfg.sound {
+    // A shared shot gets its sound and notification when the link is ready.
+    if path.is_some() && cfg.sound && !share {
         toast::play_save_sound();
     }
-    if cfg.notify {
-        let thumb = toast::thumbnail(&img);
+    // One preview per shot: the notification and the History window use it.
+    let thumb = if cfg.notify || path.is_some() || share {
+        toast::thumbnail(&img)
+    } else {
+        None
+    };
+    if cfg.notify && !share {
         let folder = path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -1216,69 +1313,100 @@ fn deliver(img: encode::Image, how: overlay::Finish) {
             balloon(&title, &body);
         }
     }
-    let Some(path) = path else { return };
-    app(|a| a.last_saved = Some(path.clone()));
+    if path.is_none() && !share {
+        return;
+    }
+    if let Some(p) = &path {
+        app(|a| a.last_saved = Some(p.clone()));
+    }
+    let entry = history::Entry {
+        id: history::new_id(),
+        time: history::now(),
+        w: img.w,
+        h: img.h,
+        thumb: thumb.as_deref().map(history::file_name).unwrap_or_default(),
+        ..Default::default()
+    };
+    if share {
+        history::set_progress(entry.id, 0);
+    }
+    let fmt = path
+        .as_deref()
+        .map(encode::format_for)
+        .unwrap_or(cfg.format);
     let effort = cfg.png_effort;
     let main = hwnd_to(hwnd);
     std::thread::spawn(move || {
-        let mut path = path;
+        let mut entry = entry;
         let mut blocked = false;
-        let mut res = encode::save(&img, &path, effort);
-        if let Err(e) = &res {
-            log(&format!("save to {} failed: {}", path.display(), e.msg));
-            if e.blocked {
-                // Probably Controlled folder access: keep the shot somewhere safe.
-                blocked = true;
-                let home = std::env::var("USERPROFILE")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| std::env::temp_dir());
-                let dir = home.join("Refract Screenshots");
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Refract".into());
-                let ext = path
-                    .extension()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "png".into());
-                path = unique_path(&dir, &name, &ext);
-                res = encode::save(&img, &path, effort);
-            }
-        }
-        let note = match res {
-            Ok(bytes) => {
-                log(&format!("saved {} ({})", path.display(), human(bytes)));
-                SaveNote {
-                    title: if blocked {
-                        "Saved to your user folder".to_string()
-                    } else {
-                        String::new()
-                    },
-                    body: if blocked {
-                        format!(
-                            "Windows blocked the Pictures folder. Saved to {}",
-                            path.display()
-                        )
-                    } else {
-                        String::new()
-                    },
-                    path: Some(path),
-                    blocked,
-                }
-            }
-            Err(e) => {
-                log(&format!("save failed: {}", e.msg));
-                SaveNote {
-                    title: "Could not save the screenshot".to_string(),
-                    body: e.msg,
-                    path: None,
-                    blocked,
-                }
-            }
+        // Encoded once: the same bytes go to the file and to the cloud.
+        let data = encode::encode(&img, fmt, effort);
+        let mut note = SaveNote {
+            title: String::new(),
+            body: String::new(),
+            path: None,
+            blocked: false,
+            entry: None,
         };
-        let b = Box::new(note);
+        match (&data, path) {
+            (Err(e), _) => {
+                log(&format!("encode failed: {e}"));
+                note.title = "Could not save the screenshot".to_string();
+                note.body = e.clone();
+            }
+            (Ok(bytes), Some(mut path)) => {
+                entry.size = bytes.len() as u64;
+                let mut res = encode::write(&path, bytes);
+                if let Err(e) = &res {
+                    log(&format!("save to {} failed: {}", path.display(), e.msg));
+                    if e.blocked {
+                        // Probably Controlled folder access: keep the shot somewhere safe.
+                        blocked = true;
+                        let home = std::env::var("USERPROFILE")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|_| std::env::temp_dir());
+                        let dir = home.join("Refract Screenshots");
+                        let name = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Refract".into());
+                        let ext = path
+                            .extension()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "png".into());
+                        path = unique_path(&dir, &name, &ext);
+                        res = encode::write(&path, bytes);
+                    }
+                }
+                match res {
+                    Ok(()) => {
+                        log(&format!("saved {} ({})", path.display(), human(entry.size)));
+                        if blocked {
+                            note.title = "Saved to your user folder".to_string();
+                            note.body = format!(
+                                "Windows blocked the Pictures folder. Saved to {}",
+                                path.display()
+                            );
+                        }
+                        entry.path = path.display().to_string();
+                        note.path = Some(path);
+                    }
+                    Err(e) => {
+                        log(&format!("save failed: {}", e.msg));
+                        note.title = "Could not save the screenshot".to_string();
+                        note.body = e.msg;
+                    }
+                }
+            }
+            (Ok(bytes), None) => entry.size = bytes.len() as u64,
+        }
+        note.blocked = blocked;
+        let id = entry.id;
+        if !entry.path.is_empty() || share {
+            note.entry = Some(entry);
+        }
         unsafe {
-            let p = Box::into_raw(b);
+            let p = Box::into_raw(Box::new(note));
             if PostMessageW(
                 hwnd_from(main),
                 WM_APP_NOTIFY,
@@ -1289,6 +1417,9 @@ fn deliver(img: encode::Image, how: overlay::Finish) {
             {
                 drop(Box::from_raw(p));
             }
+        }
+        if let (true, Some(base)) = (share, share_base) {
+            share::run(main, id, &base, data, Some(&img));
         }
     });
 }
@@ -1331,6 +1462,10 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             check_updates(h, true);
             LRESULT(0)
         }
+        WM_APP_REMOTE if wp.0 == REMOTE_SHOW_HISTORY => {
+            history::show();
+            LRESULT(0)
+        }
         WM_APP_REMOTE if wp.0 == 0 => LRESULT(0),
         WM_APP_HOTKEY | WM_APP_REMOTE => {
             if let Some(a) = hotkey::Action::from(wp.0) {
@@ -1338,12 +1473,24 @@ unsafe extern "system" fn main_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             }
             LRESULT(0)
         }
+        share::WM_APP_SHARE_PROGRESS => {
+            history::set_progress(wp.0 as u64, lp.0 as u16);
+            LRESULT(0)
+        }
+        share::WM_APP_SHARED => {
+            let d = *Box::from_raw(lp.0 as *mut share::Done);
+            share::finished(h, d, app(|a| a.cfg.sound).unwrap_or(false));
+            LRESULT(0)
+        }
         WM_APP_OVERLAY_DONE => {
             on_overlay_done();
             LRESULT(0)
         }
         WM_APP_NOTIFY => {
-            let n = *Box::from_raw(lp.0 as *mut SaveNote);
+            let mut n = *Box::from_raw(lp.0 as *mut SaveNote);
+            if let Some(e) = n.entry.take() {
+                history::add(e);
+            }
             if n.path.is_some() {
                 app(|a| a.last_saved = n.path.clone());
             }
@@ -1498,6 +1645,8 @@ fn selftest(dir: PathBuf) -> i32 {
                 at: at(0.62, 0.08),
                 text: "Refract \u{2014} \u{043f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}".into(),
                 ext: Default::default(),
+                angle: -8.0,
+                wrap: 0.0,
             },
             style: Style {
                 fill: Fill::Solid,
@@ -1552,6 +1701,31 @@ fn selftest(dir: PathBuf) -> i32 {
     if !identical {
         fail += 1;
     }
+    for test in [scroll::stitch_test, export::fx_band_test] {
+        match test() {
+            Ok(s) => out(s),
+            Err(e) => {
+                fail += 1;
+                out(format!("FAILED: {e}"));
+            }
+        }
+    }
+    for test in [export::strip_test, export::text_rotate_test] {
+        match test(&painter) {
+            Ok(s) => out(s),
+            Err(e) => {
+                fail += 1;
+                out(format!("FAILED: {e}"));
+            }
+        }
+    }
+    match overlay::text_edit_test() {
+        Ok(s) => out(s),
+        Err(e) => {
+            fail += 1;
+            out(format!("FAILED: {e}"));
+        }
+    }
 
     let raw_size = (plain.w * plain.h * 3) as u64;
     for (name, img) in [("plain", &plain), ("annotated", &annotated)] {
@@ -1605,12 +1779,19 @@ fn selftest(dir: PathBuf) -> i32 {
         }
     }
 
+    // History index and share upload (local test server).
+    fail += history::selftest(&dir, &mut out);
+    let png0 = encode::png(&plain, 0).unwrap_or_default();
+    fail += share::selftest(&png0, &mut out);
+
     // OCR + translation on a picture with real text, then UI previews.
     let text_shape = Shape {
         kind: Kind::Text {
             at: at(0.04, 0.45),
             text: "The quick brown fox jumps over the lazy dog.\nScreenshots stay pixel perfect and small.\nPress Ctrl+C to copy the recognised text.".into(),
             ext: Default::default(),
+            angle: 0.0,
+            wrap: 0.0,
         },
         style: Style { color: Rgb(0xFFFFFF), fill: Fill::Solid, width: 30.0, ..st(Tool::Text) },
     };
@@ -1832,6 +2013,72 @@ fn load_png(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
     }
 }
 
+/// Pictures of the Settings window and of the tall-picture editor, drawn off
+/// screen (nothing is shown):  refract-screener.exe --ui-shots <out dir>
+fn ui_shots(dir: PathBuf) -> i32 {
+    use geom::*;
+    use shapes::*;
+    let _ = std::fs::create_dir_all(&dir);
+    if let Err(e) = settings::render_png(&dir, 1.0) {
+        log(&format!("ui-shots: settings: {e}"));
+        return 1;
+    }
+    // A tall picture: the screen stacked 5 times, more than one effect band high.
+    let Ok(screen) = capture::grab(false, &[]) else {
+        return 1;
+    };
+    let w = screen.w.min(1100);
+    let part = screen.h.min(1100);
+    let crop = screen.crop(&RectI::new(0, 0, w, part));
+    let mut px = Vec::with_capacity((w * part * 5 * 4) as usize);
+    for _ in 0..5 {
+        px.extend_from_slice(&crop);
+    }
+    let h = part * 5;
+    if let Err(e) = scroll::render_png(&dir, &px, w as usize, h as usize) {
+        log(&format!("ui-shots: scroll panel: {e}"));
+        return 1;
+    }
+    let full = RectI::new(0, 0, w, h);
+    let shot = capture::Shot {
+        ox: 0,
+        oy: 0,
+        w,
+        h,
+        px,
+        windows: Vec::new(),
+        monitors: vec![capture::Monitor {
+            rect: full,
+            work: full,
+            scale: 1.0,
+        }],
+        foreground: None,
+    };
+    let cfg = Config::default();
+    let st = |t: Tool| cfg.style(t);
+    let shapes = vec![
+        Shape {
+            kind: Kind::Blur(p(60.0, 900.0), p(700.0, 1200.0)),
+            style: st(Tool::Blur),
+        },
+        Shape {
+            kind: Kind::Arrow(p(900.0, 520.0), p(640.0, 300.0)),
+            style: st(Tool::Arrow),
+        },
+        Shape {
+            kind: Kind::Rect(p(80.0, 120.0), p(560.0, 260.0)),
+            style: st(Tool::Rect),
+        },
+    ];
+    match overlay::preview_tall(cfg, shot, shapes, &dir) {
+        Ok(()) => 0,
+        Err(e) => {
+            log(&format!("ui-shots: editor: {e}"));
+            1
+        }
+    }
+}
+
 /// Renders the overlay UI over a given picture (README screenshots):
 ///   refract-screener.exe --demo-shots <out dir> <background.png>
 fn demo_shots(dir: PathBuf, bg: PathBuf) -> i32 {
@@ -1894,6 +2141,8 @@ fn demo_shots(dir: PathBuf, bg: PathBuf) -> i32 {
                 at: p(940.0, 470.0),
                 text: "Sharper, a third smaller".into(),
                 ext: Default::default(),
+                angle: 0.0,
+                wrap: 0.0,
             },
             style: Style {
                 fill: Fill::Solid,

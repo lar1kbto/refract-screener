@@ -1,6 +1,6 @@
 ﻿[package]
 name = "refract-screener"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2021"
 license = "MIT"
 description = "Refract-screener: screenshot tool for Windows 11 that replaces Snipping Tool"
@@ -49,6 +49,7 @@ features = [
   "Win32_Security_Cryptography",
   "Win32_System_Variant",
   "Win32_Storage_FileSystem",
+  "Win32_System_Time",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_HiDpi",

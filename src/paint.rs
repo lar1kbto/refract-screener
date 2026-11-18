@@ -1,10 +1,10 @@
 //! Direct2D drawing of annotations. The same code renders the live overlay and the
 //! exported image, so what you see is exactly what gets saved.
 
-use crate::config::{Fill, Rgb, Tool};
+use crate::config::{Fill, Rgb, Style, Tool};
 use crate::geom::*;
 use crate::ocr::Block;
-use crate::shapes::{Kind, Shape};
+use crate::shapes::{Align, Kind, Shape};
 use windows::core::Result;
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -59,7 +59,9 @@ pub struct Painter {
 }
 
 /// Returns the full-screen blurred / pixelated bitmap for (tool, strength).
-pub type FxSource<'a> = &'a mut dyn FnMut(Tool, u32) -> Option<ID2D1Bitmap>;
+/// Blurred / pixelated picture for (tool, strength) covering a rectangle: the
+/// bands that cover it, each with its rectangle in image coordinates.
+pub type FxSource<'a> = &'a mut dyn FnMut(Tool, u32, RectF) -> Vec<(ID2D1Bitmap, RectF)>;
 
 impl Painter {
     pub fn new(font: &str, radius: f32) -> Result<Painter> {
@@ -141,6 +143,142 @@ impl Painter {
         (m.widthIncludingTrailingWhitespace.max(m.width), m.height)
     }
 
+    /// Layout of a text annotation and its size (width, line-box height). Lines
+    /// wrap in `wrap` pixels when it is set; otherwise they are aligned inside
+    /// the width of the longest one.
+    pub fn text_layout(
+        &self,
+        text: &str,
+        st: &Style,
+        wrap: f32,
+    ) -> Result<(IDWriteTextLayout, f32, f32)> {
+        let w = st.width;
+        let f = unsafe {
+            self.dw.CreateTextFormat(
+                windows::core::PCWSTR(self.font.as_ptr()),
+                None,
+                if st.bold {
+                    DWRITE_FONT_WEIGHT_SEMI_BOLD
+                } else {
+                    DWRITE_FONT_WEIGHT_NORMAL
+                },
+                if st.italic {
+                    DWRITE_FONT_STYLE_ITALIC
+                } else {
+                    DWRITE_FONT_STYLE_NORMAL
+                },
+                DWRITE_FONT_STRETCH_NORMAL,
+                w.max(1.0),
+                windows::core::w!("en-us"),
+            )?
+        };
+        let wrapped = wrap > 0.0;
+        unsafe {
+            let _ = f.SetWordWrapping(if wrapped {
+                DWRITE_WORD_WRAPPING_EMERGENCY_BREAK
+            } else {
+                DWRITE_WORD_WRAPPING_NO_WRAP
+            });
+        }
+        let l = self.layout(text, &f, if wrapped { wrap } else { 8000.0 }, 8000.0)?;
+        let (mut tw, th) = Self::metrics(&l);
+        if wrapped {
+            tw = wrap;
+        }
+        unsafe {
+            l.SetMaxWidth(tw.max(1.0))?;
+            l.SetTextAlignment(match st.align {
+                Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+                Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+            })?;
+        }
+        Ok((l, tw, th.max(w * 1.25)))
+    }
+
+    /// Caret (x, y, height) in layout coordinates for the UTF-16 offset `k`.
+    pub fn caret_xy(l: &IDWriteTextLayout, text: &str, k: usize, w: f32) -> (f32, f32, f32) {
+        let n = text.encode_utf16().count();
+        let k = k.min(n);
+        if k == n && text.ends_with('\n') {
+            // After a final line break: the start of the empty last line.
+            let lines = Self::line_metrics(l);
+            let y: f32 = lines
+                .iter()
+                .take(lines.len().saturating_sub(1))
+                .map(|m| m.height)
+                .sum();
+            let h = lines.last().map(|m| m.height).unwrap_or(w * 1.25);
+            let (mw, al) = unsafe { (l.GetMaxWidth(), l.GetTextAlignment()) };
+            let x = match al {
+                DWRITE_TEXT_ALIGNMENT_CENTER => mw * 0.5,
+                DWRITE_TEXT_ALIGNMENT_TRAILING => mw,
+                _ => 0.0,
+            };
+            return (x, y, h);
+        }
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            let _ = if k < n {
+                l.HitTestTextPosition(k as u32, BOOL(0), &mut x, &mut y, &mut m)
+            } else {
+                l.HitTestTextPosition(k as u32 - 1, BOOL(1), &mut x, &mut y, &mut m)
+            };
+        }
+        let h = if m.height > 0.0 { m.height } else { w * 1.25 };
+        (x, y, h)
+    }
+
+    fn line_metrics(l: &IDWriteTextLayout) -> Vec<DWRITE_LINE_METRICS> {
+        let mut n = 0u32;
+        unsafe {
+            let _ = l.GetLineMetrics(None, &mut n);
+            let mut v = vec![DWRITE_LINE_METRICS::default(); n as usize];
+            if l.GetLineMetrics(Some(&mut v), &mut n).is_err() {
+                return Vec::new();
+            }
+            v.truncate(n as usize);
+            v
+        }
+    }
+
+    /// UTF-16 offset of the caret position nearest to the layout point (x, y).
+    pub fn caret_at(l: &IDWriteTextLayout, text: &str, x: f32, y: f32) -> usize {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let n = units.len();
+        if text.ends_with('\n') {
+            let lines = Self::line_metrics(l);
+            let top: f32 = lines
+                .iter()
+                .take(lines.len().saturating_sub(1))
+                .map(|m| m.height)
+                .sum();
+            if y >= top {
+                return n;
+            }
+        }
+        let (mut trailing, mut inside) = (BOOL(0), BOOL(0));
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            if l
+                .HitTestPoint(x, y, &mut trailing, &mut inside, &mut m)
+                .is_err()
+            {
+                return n;
+            }
+        }
+        let mut k = m.textPosition as usize;
+        if trailing.as_bool() {
+            k += m.length as usize;
+            // Past the end of a line: before its line break, not after it.
+            if k > 0 && units.get(k - 1) == Some(&10) {
+                k -= 1;
+            }
+        }
+        k.min(n)
+    }
+
     fn path(&self, build: impl FnOnce(&ID2D1GeometrySink)) -> Result<ID2D1PathGeometry> {
         unsafe {
             let g = self.d2d.CreatePathGeometry()?;
@@ -212,10 +350,11 @@ impl Painter {
         rt: &ID2D1RenderTarget,
         shapes: &[Shape],
         fx: FxSource,
-        caret: Option<usize>,
+        caret: Option<(usize, usize)>,
     ) {
         for (i, s) in shapes.iter().enumerate() {
-            let _ = self.draw_shape(rt, s, fx, caret == Some(i));
+            let k = caret.filter(|c| c.0 == i).map(|c| c.1);
+            let _ = self.draw_shape(rt, s, fx, k);
         }
     }
 
@@ -224,13 +363,13 @@ impl Painter {
         rt: &ID2D1RenderTarget,
         s: &Shape,
         fx: FxSource,
-        caret: bool,
+        caret: Option<usize>,
     ) -> Result<()> {
         if s.style.shadow && !matches!(s.kind, Kind::Blur(..) | Kind::Pixelate(..)) {
             let k = (s.style.width * 0.12).clamp(1.0, 4.0);
             for (dx, dy, a) in [(k * 0.6, k * 1.6, 0.16), (k * 0.25, k * 0.8, 0.18)] {
                 self.with_offset(rt, dx, dy, |rt| {
-                    self.pass(rt, s, fx, Some(a * s.style.opacity), false)
+                    self.pass(rt, s, fx, Some(a * s.style.opacity), None)
                 })?;
             }
         }
@@ -264,7 +403,7 @@ impl Painter {
         s: &Shape,
         fx: FxSource,
         shadow: Option<f32>,
-        caret: bool,
+        caret: Option<usize>,
     ) -> Result<()> {
         let st = s.style;
         let w = st.width;
@@ -326,75 +465,89 @@ impl Painter {
                     let r = RectF::from_pts(*a, *b);
                     let r = RectF::new(r.l.round(), r.t.round(), r.r.round(), r.b.round());
                     let tool = s.tool();
-                    match fx(tool, w.round() as u32) {
-                        Some(bmp) => {
-                            let mode = if tool == Tool::Pixelate {
-                                D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
-                            } else {
-                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
-                            };
-                            rt.DrawBitmap(&bmp, Some(&rc(r)), 1.0, mode, Some(&rc(r)));
+                    let bands = fx(tool, w.round() as u32, r);
+                    if bands.is_empty() && r.w() > 0.0 && r.h() > 0.0 {
+                        rt.FillRectangle(&rc(r), &self.brush(rt, rgba(0.5, 0.5, 0.5, 0.85))?)
+                    }
+                    let mode = if tool == Tool::Pixelate {
+                        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                    } else {
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+                    };
+                    for (bmp, band) in bands {
+                        let d = RectF::new(r.l, r.t.max(band.t), r.r, r.b.min(band.b));
+                        if d.h() <= 0.0 || d.w() <= 0.0 {
+                            continue;
                         }
-                        None => {
-                            rt.FillRectangle(&rc(r), &self.brush(rt, rgba(0.5, 0.5, 0.5, 0.85))?)
-                        }
+                        let src = d.translate(-band.l, -band.t);
+                        rt.DrawBitmap(&bmp, Some(&rc(d)), 1.0, mode, Some(&rc(src)));
                     }
                 }
-                Kind::Text { at, text, ext } => {
-                    let f = self.format(w, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
-                    let l = self.layout(text, &f, 8000.0, 8000.0)?;
-                    let (tw, th) = Self::metrics(&l);
-                    let th = th.max(w * 1.25);
+                Kind::Text {
+                    at, text, ext, wrap, ..
+                } => {
+                    let (l, tw, th) = self.text_layout(text, &st, *wrap)?;
                     ext.set((tw, th));
-                    let pad = s.text_pad();
-                    let bx = RectF::xywh(
-                        at.x - pad,
-                        at.y - pad,
-                        tw.max(w * 0.3) + pad * 2.0,
-                        th + pad * 2.0,
-                    );
-                    let rad = (pad * 1.2).min(self.radius.max(4.0));
-                    let fg = match (st.fill, shadow) {
-                        (_, Some(_)) => {
-                            if st.fill != Fill::None {
-                                rt.FillRoundedRectangle(&rrect(bx, rad), &br);
-                                return Ok(());
-                            }
-                            main
-                        }
-                        (Fill::None, None) => main,
-                        (Fill::Soft, None) => {
-                            rt.FillRoundedRectangle(
-                                &rrect(bx, rad),
-                                &self.brush(rt, rgba(0.07, 0.075, 0.09, 0.78 * st.opacity))?,
-                            );
-                            main
-                        }
-                        (Fill::Solid, None) => {
-                            rt.FillRoundedRectangle(&rrect(bx, rad), &br);
-                            col(contrast(st.color), st.opacity)
-                        }
+                    let Some((bx, angle)) = s.text_box() else {
+                        return Ok(());
                     };
-                    let fb = self.brush(rt, fg)?;
-                    rt.DrawTextLayout(pt(*at), &l, &fb, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-                    if caret && shadow.is_none() {
-                        let (mut x, mut y) = (0.0f32, 0.0f32);
-                        let mut m = DWRITE_HIT_TEST_METRICS::default();
-                        let n = text.encode_utf16().count() as u32;
-                        let _ = if n == 0 {
-                            l.HitTestTextPosition(0, BOOL(0), &mut x, &mut y, &mut m)
-                        } else {
-                            l.HitTestTextPosition(n - 1, BOOL(1), &mut x, &mut y, &mut m)
-                        };
-                        let h = if m.height > 0.0 { m.height } else { w * 1.25 };
-                        rt.DrawLine(
-                            pt(p(at.x + x + 1.0, at.y + y + 1.0)),
-                            pt(p(at.x + x + 1.0, at.y + y + h - 1.0)),
-                            &fb,
-                            (w * 0.07).max(1.5),
-                            &self.round,
+                    // Turn about the centre of the box, on top of whatever
+                    // transform (view, export strip, shadow offset) is set.
+                    let mut m0 = windows::Foundation::Numerics::Matrix3x2::default();
+                    rt.GetTransform(&mut m0);
+                    if angle != 0.0 {
+                        let r = windows::Foundation::Numerics::Matrix3x2::rotation(
+                            angle,
+                            bx.cx(),
+                            bx.cy(),
                         );
+                        rt.SetTransform(&(r * m0));
                     }
+                    let res = (|| -> Result<()> {
+                        let pad = s.text_pad();
+                        let rad = (pad * 1.2).min(self.radius.max(4.0));
+                        let fg = match (st.fill, shadow) {
+                            (_, Some(_)) => {
+                                if st.fill != Fill::None {
+                                    rt.FillRoundedRectangle(&rrect(bx, rad), &br);
+                                    return Ok(());
+                                }
+                                main
+                            }
+                            (Fill::None, None) => main,
+                            (Fill::Soft, None) => {
+                                rt.FillRoundedRectangle(
+                                    &rrect(bx, rad),
+                                    &self.brush(rt, rgba(0.07, 0.075, 0.09, 0.78 * st.opacity))?,
+                                );
+                                main
+                            }
+                            (Fill::Solid, None) => {
+                                rt.FillRoundedRectangle(&rrect(bx, rad), &br);
+                                col(contrast(st.color), st.opacity)
+                            }
+                        };
+                        let fb = self.brush(rt, fg)?;
+                        rt.DrawTextLayout(
+                            pt(*at),
+                            &l,
+                            &fb,
+                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                        );
+                        if let (Some(k), None) = (caret, shadow) {
+                            let (x, y, h) = Self::caret_xy(&l, text, k, w);
+                            rt.DrawLine(
+                                pt(p(at.x + x + 1.0, at.y + y + 1.0)),
+                                pt(p(at.x + x + 1.0, at.y + y + h - 1.0)),
+                                &fb,
+                                (w * 0.07).max(1.5),
+                                &self.round,
+                            );
+                        }
+                        Ok(())
+                    })();
+                    rt.SetTransform(&m0);
+                    res?;
                 }
                 Kind::Counter { at, n } => {
                     let r = s.counter_radius();

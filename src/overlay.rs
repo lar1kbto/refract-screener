@@ -4,7 +4,7 @@
 use crate::capture::Shot;
 use crate::config::*;
 use crate::encode::{self, Image};
-use crate::export::{self, FxCache};
+use crate::export::{self, FxCache, FxKey};
 use crate::geom::*;
 use crate::ocr::{self, OcrReply, TranslateReply};
 use crate::paint::*;
@@ -13,7 +13,7 @@ use crate::win::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use windows::core::Result;
+use windows::core::{Interface, Result};
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -33,6 +33,10 @@ pub enum Finish {
     Save,
     SaveAs,
     Cancel,
+    /// Upload to the Refract cloud and copy the link.
+    Share,
+    /// Scrolling capture of this area of the screen (screen pixels).
+    Scroll(RectI),
 }
 
 pub struct Done {
@@ -49,7 +53,9 @@ enum Hit {
     Undo,
     Redo,
     Save,
+    Scroll,
     Copy,
+    Share,
     Close,
     Done,
     Swatch(usize),
@@ -61,6 +67,11 @@ enum Hit {
     PickSv,
     PickHue,
     LangItem(usize),
+    Align(Align),
+    Bold,
+    Italic,
+    /// Turn the selected text 15 degrees left (-1) or right (1).
+    Turn(i32),
     Panel,
 }
 
@@ -74,12 +85,21 @@ impl Hit {
             Hit::Undo => "Undo (Ctrl+Z)",
             Hit::Redo => "Redo (Ctrl+Y)",
             Hit::Save => "Save as... (Ctrl+Shift+S)",
+            Hit::Scroll => "Long screenshot: scroll this area yourself",
             Hit::Copy => "Copy (Ctrl+C)",
+            Hit::Share => "Share link (Ctrl+Shift+C)",
             Hit::Close => "Cancel (Esc)",
             Hit::Done => "Done: copy and save (Enter)",
             Hit::Custom => "Custom colour  -  I picks from screen",
             Hit::Fill => "Fill: none / soft / solid",
             Hit::Shadow => "Shadow",
+            Hit::Align(Align::Left) => "Align left (Ctrl+L)",
+            Hit::Align(Align::Center) => "Centre (Ctrl+E)",
+            Hit::Align(Align::Right) => "Align right (Ctrl+R)",
+            Hit::Bold => "Bold",
+            Hit::Italic => "Italic",
+            Hit::Turn(d) if d < 0 => "Turn left 15\u{00B0} (Ctrl+[)  -  or drag the knob under the text",
+            Hit::Turn(_) => "Turn right 15\u{00B0} (Ctrl+])  -  or drag the knob under the text",
             _ => return None,
         })
     }
@@ -101,9 +121,27 @@ enum Drag {
     Draw,
     MoveShape { idx: usize, last: P },
     ShapeHandle { idx: usize, handle: usize },
+    /// Turning a text by its knob; `grab` = pointer angle minus text angle.
+    Rotate { idx: usize, grab: f32 },
+    /// Resizing a text's font by a corner of its box.
+    TextScale { idx: usize, corner: usize, orig: Box<Shape> },
+    /// Setting the width a text wraps in by its left or right edge.
+    TextWrap { idx: usize, side: usize, orig: Box<Shape> },
     Slider(Hit),
     Picker(Hit),
     Words { anchor: usize },
+}
+
+/// What part of the selected text's frame is under the pointer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TextGrip {
+    Rotate,
+    /// Top-right, bottom-right or bottom-left corner: font size.
+    Corner(usize),
+    /// Left (0) or right (1) edge: width the lines wrap in.
+    Side(usize),
+    /// The cross on the top-left corner.
+    Delete,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -138,8 +176,17 @@ pub struct Overlay {
     rt: Option<ID2D1HwndRenderTarget>,
     base: Option<ID2D1Bitmap>,
     fx: FxCache,
-    fx_bmp: HashMap<(Tool, u32), ID2D1Bitmap>,
+    fx_bmp: HashMap<FxKey, ID2D1Bitmap>,
     dashed: Option<ID2D1StrokeStyle>,
+    /// Opened by the scrolling capture hotkey: the selection starts the capture.
+    pick_scroll: bool,
+    /// A tall picture (scrolling capture), shown zoomed and scrolled.
+    view: Option<View>,
+    /// The tall picture as GPU bitmaps of TILE rows, made when first visible.
+    tiles: Vec<Option<ID2D1Bitmap>>,
+    vdrag: VDrag,
+    /// Mouse in window pixels (tall view only; `mouse` is in image pixels).
+    win_mouse: P,
 
     phase: Phase,
     sel: Option<RectI>,
@@ -150,7 +197,11 @@ pub struct Overlay {
     shapes: Vec<Shape>,
     current: Option<Shape>,
     editing: Option<usize>,
+    /// Caret in the text being edited, a byte offset.
+    caret: usize,
     selected: Option<usize>,
+    /// Last wheel change of a shape: a burst of notches is one undo step.
+    wheel_at: Option<Instant>,
     undo: Vec<Vec<Shape>>,
     redo: Vec<Vec<Shape>>,
     popup: Popup,
@@ -179,10 +230,45 @@ pub fn take() -> Option<Overlay> {
     CURRENT.with(|c| c.try_borrow_mut().ok().and_then(|mut o| o.take()))
 }
 
+/// How a tall picture is shown: window = image * k + (tx, ty).
+#[derive(Clone, Copy, Debug)]
+struct View {
+    k: f32,
+    tx: f32,
+    ty: f32,
+    /// Window size.
+    ww: f32,
+    wh: f32,
+    /// Size of one UI pixel in window pixels.
+    ui: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VDrag {
+    None,
+    Pan { at: P, tx: f32, ty: f32 },
+    Thumb { grab: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Chrome {
+    Thumb,
+    TrackUp,
+    TrackDown,
+    Zoom,
+}
+
+/// Rows per GPU bitmap of a tall picture.
+const TILE: i32 = 4096;
+const TIMER_EDGE: usize = 2;
+/// Selections taller than this are read in bands and not recognised automatically.
+const TALL_OCR: i32 = 2400;
+
 impl Drop for Overlay {
     fn drop(&mut self) {
         self.rt = None;
         self.base = None;
+        self.tiles.clear();
         self.fx_bmp.clear();
         unsafe {
             let _ = DestroyWindow(self.hwnd);
@@ -209,7 +295,9 @@ fn register_class() {
 }
 
 /// Shows the capture overlay for `shot`.
-pub fn open(main: HWND, cfg: Config, shot: Shot) -> Result<()> {
+/// Shows the capture overlay for `shot`. With `pick_scroll`, the selected area
+/// is handed to the scrolling capture.
+pub fn open(main: HWND, cfg: Config, shot: Shot, pick_scroll: bool) -> Result<()> {
     register_class();
     let painter = Painter::new(&cfg.font, cfg.corner_radius)?;
     unsafe {
@@ -229,7 +317,8 @@ pub fn open(main: HWND, cfg: Config, shot: Shot) -> Result<()> {
             GetModuleHandleW(None).unwrap_or_default(),
             None,
         )?;
-        let ov = build(hwnd, main, cfg, shot, painter);
+        let mut ov = build(hwnd, main, cfg, shot, painter);
+        ov.pick_scroll = pick_scroll;
         CURRENT.with(|c| *c.borrow_mut() = Some(ov));
 
         // Paint the first frame while the window is cloaked: no flash on show.
@@ -240,6 +329,76 @@ pub fn open(main: HWND, cfg: Config, shot: Shot) -> Result<()> {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             o.mouse = p((pt.x - o.shot.ox) as f32, (pt.y - o.shot.oy) as f32);
+            o.render();
+            Some(())
+        });
+        let uncloak: BOOL = FALSE;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &uncloak as *const _ as *const _, 4);
+        force_foreground(hwnd);
+    }
+    Ok(())
+}
+
+/// Opens the editor for a tall picture (a scrolling capture) on `monitor`
+/// (screen pixels), scaled to fit its width and scrolled to the top.
+pub fn open_tall(
+    main: HWND,
+    cfg: Config,
+    shot: Shot,
+    monitor: RectI,
+    note: Option<String>,
+) -> Result<()> {
+    register_class();
+    let painter = Painter::new(&cfg.font, cfg.corner_radius)?;
+    unsafe {
+        let name = W::new(OVERLAY_CLASS);
+        let title = W::new("Refract-screener editor");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            name.p(),
+            title.p(),
+            WS_POPUP,
+            monitor.l,
+            monitor.t,
+            monitor.w(),
+            monitor.h(),
+            None,
+            None,
+            GetModuleHandleW(None).unwrap_or_default(),
+            None,
+        )?;
+        let ui = shot.monitors.first().map(|m| m.scale).unwrap_or(1.0) * cfg.ui_scale;
+        let mut ov = build(hwnd, main, cfg, shot, painter);
+        let (ww, wh) = (monitor.w() as f32, monitor.h() as f32);
+        let room = ww - 2.0 * 16.0 * ui;
+        let k = (room / ov.shot.w as f32).min(1.0);
+        ov.view = Some(View {
+            k,
+            tx: 0.0,
+            ty: 0.0,
+            ww,
+            wh,
+            ui,
+        });
+        ov.clamp_view();
+        if let Some(v) = ov.view.as_mut() {
+            v.ty = 16.0 * ui;
+        }
+        ov.clamp_view();
+        ov.phase = Phase::Editing;
+        ov.sel = Some(ov.shot.full());
+        if let Some(n) = note {
+            ov.toast(n, false);
+        }
+        CURRENT.with(|c| *c.borrow_mut() = Some(ov));
+        let cloak: BOOL = TRUE;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak as *const _ as *const _, 4);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        with(|o| {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            o.win_mouse = p((pt.x - monitor.l) as f32, (pt.y - monitor.t) as f32);
+            o.mouse = o.to_img(o.win_mouse);
             o.render();
             Some(())
         });
@@ -265,6 +424,11 @@ fn build(hwnd: HWND, main: HWND, cfg: Config, shot: Shot, painter: Painter) -> O
         fx: FxCache::default(),
         fx_bmp: HashMap::new(),
         dashed: None,
+        pick_scroll: false,
+        view: None,
+        tiles: Vec::new(),
+        vdrag: VDrag::None,
+        win_mouse: P::default(),
         phase: Phase::Selecting,
         sel: None,
         drag: Drag::None,
@@ -274,7 +438,9 @@ fn build(hwnd: HWND, main: HWND, cfg: Config, shot: Shot, painter: Painter) -> O
         shapes: Vec::new(),
         current: None,
         editing: None,
+        caret: 0,
         selected: None,
+        wheel_at: None,
         undo: Vec::new(),
         redo: Vec::new(),
         popup: Popup::None,
@@ -341,6 +507,33 @@ pub fn preview(
     o.tool = Tool::Arrow;
     o.hover = Some(Hit::Tool(Tool::Arrow));
     render_to(&mut o, &dir.join("ui-2-editing.png"))?;
+
+    // A turned text with its frame: dashed box, corner grips and the knob.
+    {
+        let keep = o.shapes.clone();
+        let sf = sel.f();
+        o.shapes.push(Shape {
+            kind: Kind::Text {
+                at: p(sf.l + sf.w() * 0.18, sf.t + sf.h() * 0.42),
+                text: "Turned text
+with a second line".into(),
+                ext: Default::default(),
+                angle: -12.0,
+                wrap: 0.0,
+            },
+            style: Style {
+                fill: Fill::Solid,
+                width: 30.0,
+                align: Align::Center,
+                ..o.cfg.style(Tool::Text)
+            },
+        });
+        o.tool = Tool::Select;
+        o.hover = None;
+        o.selected = Some(o.shapes.len() - 1);
+        render_to(&mut o, &dir.join("ui-5-text-turned.png"))?;
+        o.shapes = keep;
+    }
 
     o.selected = None;
     o.hover = None;
@@ -479,6 +672,8 @@ fn key_down(vk: VIRTUAL_KEY) -> bool {
 
 impl Overlay {
     fn s(&self) -> f32 {
+        // In the tall view the UI is drawn in image pixels too, at 1/k of its size.
+        let k = self.view.map(|v| v.k).unwrap_or(1.0);
         let c = self
             .sel
             .map(|r| (r.l + r.w() / 2, r.t + r.h() / 2))
@@ -488,6 +683,7 @@ impl Overlay {
             .map(|m| m.scale)
             .unwrap_or(1.0)
             * self.cfg.ui_scale
+            / k
     }
 
     fn style(&self) -> Style {
@@ -509,12 +705,14 @@ impl Overlay {
             if checkpoint {
                 self.checkpoint();
             }
+            let keep = self.text_corner(i);
             if let Some(s) = self.shapes.get_mut(i) {
                 s.style = st;
                 if let Kind::Text { ext, .. } = &s.kind {
                     ext.set((0.0, 0.0));
                 }
             }
+            self.refit_text(i, keep);
         }
         self.cfg.set_style(t, st);
     }
@@ -554,6 +752,9 @@ impl Overlay {
     // ---------------------------------------------------------------- layout
 
     fn monitor_work(&self, r: &RectI) -> RectF {
+        if self.view.is_some() {
+            return self.visible();
+        }
         self.shot
             .monitor_at(r.l + r.w() / 2, r.t + r.h() / 2)
             .map(|m| m.work.f())
@@ -589,8 +790,14 @@ impl Overlay {
         row1.push((b, Some(Hit::Undo)));
         row1.push((b, Some(Hit::Redo)));
         row1.push((sep, None));
+        if self.view.is_none() {
+            row1.push((b, Some(Hit::Scroll)));
+        }
         row1.push((b, Some(Hit::Save)));
         row1.push((b, Some(Hit::Copy)));
+        if crate::share::enabled(&self.cfg) {
+            row1.push((b, Some(Hit::Share)));
+        }
         row1.push((b, Some(Hit::Close)));
         row1.push((b, Some(Hit::Done)));
 
@@ -607,6 +814,21 @@ impl Overlay {
         row2.push((sep * 0.5, None));
         row2.push((b, Some(Hit::Fill)));
         row2.push((b, Some(Hit::Shadow)));
+        if self.style_tool() == Tool::Text {
+            let tb = 30.0 * s;
+            row2.push((sep, None));
+            for a in [Align::Left, Align::Center, Align::Right] {
+                row2.push((tb, Some(Hit::Align(a))));
+            }
+            row2.push((sep * 0.5, None));
+            row2.push((tb, Some(Hit::Bold)));
+            row2.push((tb, Some(Hit::Italic)));
+            if self.text_target().is_some() {
+                row2.push((sep * 0.5, None));
+                row2.push((tb, Some(Hit::Turn(-1))));
+                row2.push((tb, Some(Hit::Turn(1))));
+            }
+        }
 
         let w1: f32 = row1.iter().map(|x| x.0).sum();
         let w2: f32 = row2.iter().map(|x| x.0).sum();
@@ -625,6 +847,7 @@ impl Overlay {
                 y = (selr.b - ph - gap).max(work.t + 8.0);
             }
         }
+        let y = y.min(work.b - ph - 8.0).max(work.t + 8.0);
         let panel = RectF::xywh(x, y, pw, ph);
         let mut out = vec![(panel, Hit::Panel)];
         let mut cx = x + pad + (pw - pad * 2.0 - w1) * 0.5;
@@ -773,13 +996,23 @@ impl Overlay {
         self.ocr.result = None;
         self.ocr.range = None;
         let px = self.shot.crop(&sel);
-        ocr::spawn_ocr(
-            hwnd_to(self.hwnd),
-            self.ocr.gen,
-            sel,
-            px,
-            self.cfg.ocr_language.clone(),
-        );
+        if sel.h() > TALL_OCR {
+            crate::scroll::spawn_ocr_bands(
+                hwnd_to(self.hwnd),
+                self.ocr.gen,
+                sel,
+                px,
+                self.cfg.ocr_language.clone(),
+            );
+        } else {
+            ocr::spawn_ocr(
+                hwnd_to(self.hwnd),
+                self.ocr.gen,
+                sel,
+                px,
+                self.cfg.ocr_language.clone(),
+            );
+        }
         unsafe {
             SetTimer(self.hwnd, 1, 120, None);
         }
@@ -797,7 +1030,8 @@ impl Overlay {
 
     fn after_sel_change(&mut self) {
         self.reset_ocr();
-        if self.cfg.auto_ocr || self.ocr.mode || self.tr.on {
+        let tall = self.sel.is_some_and(|r| r.h() > TALL_OCR);
+        if (self.cfg.auto_ocr && !tall) || self.ocr.mode || self.tr.on {
             self.ensure_ocr();
         }
     }
@@ -946,6 +1180,227 @@ impl Overlay {
         }
     }
 
+    /// The text whose frame is shown: the one being edited or the selected one.
+    fn text_target(&self) -> Option<usize> {
+        self.editing
+            .or(self.selected)
+            .filter(|&i| matches!(self.shapes.get(i).map(|s| &s.kind), Some(Kind::Text { .. })))
+    }
+
+    /// Distance of the rotation knob above the text box.
+    fn knob_off(&self) -> f32 {
+        22.0 * self.s()
+    }
+
+    fn text_grip_at(&self, q: P) -> Option<(usize, TextGrip)> {
+        if self.ocr.mode || !matches!(self.tool, Tool::Select | Tool::Text) {
+            return None;
+        }
+        let i = self.text_target()?;
+        let s = self.shapes.get(i)?;
+        let tol = 8.0 * self.s();
+        if let Some((_, knob)) = s.rot_handle(self.knob_off()) {
+            if knob.dist(q) <= tol + 2.0 * self.s() {
+                return Some((i, TextGrip::Rotate));
+            }
+        }
+        let cs = s.text_corners()?;
+        if cs[0].dist(q) <= tol + 1.0 * self.s() {
+            return Some((i, TextGrip::Delete));
+        }
+        if let Some(c) = (1..4).find(|&c| cs[c].dist(q) <= tol) {
+            return Some((i, TextGrip::Corner(c)));
+        }
+        s.text_sides()?
+            .iter()
+            .position(|m| m.dist(q) <= tol)
+            .map(|k| (i, TextGrip::Side(k)))
+    }
+
+    /// Top-left corner of a turned text (None when it is not turned).
+    fn text_corner(&self, i: usize) -> Option<P> {
+        let s = self.shapes.get(i)?;
+        match &s.kind {
+            Kind::Text { angle, .. } if *angle != 0.0 => s.text_corners().map(|c| c[0]),
+            _ => None,
+        }
+    }
+
+    /// Measures text `i` again and moves it so its turned box keeps the top-left
+    /// corner at `keep`: a turned text grows from where it starts, like an unturned one.
+    fn refit_text(&mut self, i: usize, keep: Option<P>) {
+        if let Some(keep) = keep {
+            self.pin_corner(i, 0, keep);
+        }
+    }
+
+    /// Measures text `i` again and moves it so its corner `k` is at `at`.
+    fn pin_corner(&mut self, i: usize, k: usize, at: P) {
+        let Some(s) = self.shapes.get(i) else { return };
+        let Kind::Text {
+            text, ext, wrap, ..
+        } = &s.kind
+        else {
+            return;
+        };
+        if let Ok((_, tw, th)) = self.painter.text_layout(text, &s.style, *wrap) {
+            ext.set((tw, th));
+        }
+        if let Some(c) = s.text_corners() {
+            let d = at.sub(c[k]);
+            self.shapes[i].translate(d);
+        }
+    }
+
+    fn rotate_text(&mut self, i: usize, by: f32) {
+        if let Some(Shape {
+            kind: Kind::Text { angle, .. },
+            ..
+        }) = self.shapes.get_mut(i)
+        {
+            let a = wrap_deg(*angle + by);
+            *angle = if a.abs() < 0.01 { 0.0 } else { a };
+        }
+    }
+
+    /// Alignment of the selected text, or of new texts when none is selected.
+    fn align_text(&mut self, a: Align) {
+        if self.text_target().is_none() && self.tool != Tool::Text {
+            return;
+        }
+        let mut st = self.style();
+        st.align = a;
+        self.set_style(st, true);
+        let name = match a {
+            Align::Left => "Text aligned left",
+            Align::Center => "Text centred",
+            Align::Right => "Text aligned right",
+        };
+        self.toast(name, false);
+    }
+
+    /// Ctrl+D: a copy of the selected shape, a little down and to the right.
+    fn duplicate(&mut self) {
+        let Some(i) = self.selected else { return };
+        if self.shapes.get(i).is_none_or(|s| s.is_degenerate()) {
+            return;
+        }
+        self.commit_text();
+        let mut c = self.shapes[i].clone();
+        let d = 16.0 * self.s();
+        c.translate(p(d, d));
+        if let Kind::Counter { n, .. } = &mut c.kind {
+            *n = self.next_counter();
+        }
+        self.checkpoint();
+        self.shapes.push(c);
+        let j = self.shapes.len() - 1;
+        self.selected = Some(j);
+        self.hsv = self.shapes[j].style.color.to_hsv();
+    }
+
+    /// Caret of the edited text as a UTF-16 offset (for DirectWrite).
+    fn caret16(&self) -> usize {
+        match self.editing.and_then(|i| self.shapes.get(i)).map(|s| &s.kind) {
+            Some(Kind::Text { text, .. }) => {
+                let c = clamp_caret(text, self.caret);
+                text[..c].encode_utf16().count()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Caret position under image point `q` in text `i`, a byte offset.
+    fn caret_at_point(&self, i: usize, q: P) -> usize {
+        let Some(s) = self.shapes.get(i) else { return 0 };
+        let Kind::Text { at, text, wrap, .. } = &s.kind else {
+            return 0;
+        };
+        let Ok((l, _, _)) = self.painter.text_layout(text, &s.style, *wrap) else {
+            return text.len();
+        };
+        let lq = s.text_local(q).sub(*at);
+        byte_at_u16(text, Painter::caret_at(&l, text, lq.x, lq.y))
+    }
+
+    /// Arrow keys, Home and End while typing.
+    fn move_caret(&mut self, vk: VIRTUAL_KEY, ctrl: bool) {
+        let Some(i) = self.editing else { return };
+        let Some(s) = self.shapes.get(i) else { return };
+        let Kind::Text { text, wrap, .. } = &s.kind else {
+            return;
+        };
+        let c = clamp_caret(text, self.caret);
+        self.caret = match vk {
+            VK_LEFT if ctrl => word_left(text, c),
+            VK_RIGHT if ctrl => word_right(text, c),
+            VK_LEFT => text[..c].chars().next_back().map_or(c, |ch| c - ch.len_utf8()),
+            VK_RIGHT => text[c..].chars().next().map_or(c, |ch| c + ch.len_utf8()),
+            VK_HOME if ctrl => 0,
+            VK_END if ctrl => text.len(),
+            VK_HOME => text[..c].rfind('\n').map_or(0, |x| x + 1),
+            VK_END => text[c..].find('\n').map_or(text.len(), |x| c + x),
+            VK_UP if ctrl => 0,
+            VK_DOWN if ctrl => text.len(),
+            _ => {
+                // Up / Down: the nearest position on the line above or below.
+                let w = s.style.width;
+                let Ok((l, _, th)) = self.painter.text_layout(text, &s.style, *wrap) else {
+                    return;
+                };
+                let k = text[..c].encode_utf16().count();
+                let (x, y, h) = Painter::caret_xy(&l, text, k, w);
+                let ty = if vk == VK_UP { y - h * 0.5 } else { y + h * 1.5 };
+                if ty < 0.0 {
+                    0
+                } else if ty > th {
+                    text.len()
+                } else {
+                    byte_at_u16(text, Painter::caret_at(&l, text, x + 0.5, ty))
+                }
+            }
+        };
+    }
+
+    /// Typing and pasting: inserts at the caret.
+    fn insert_text(&mut self, t: &str) {
+        let Some(i) = self.editing else { return };
+        let keep = self.text_corner(i);
+        if let Some(Shape {
+            kind: Kind::Text { text, .. },
+            ..
+        }) = self.shapes.get_mut(i)
+        {
+            let c = clamp_caret(text, self.caret);
+            text.insert_str(c, t);
+            self.caret = c + t.len();
+        }
+        self.refit_text(i, keep);
+    }
+
+    /// Backspace / Delete, with Ctrl a whole word.
+    fn erase(&mut self, forward: bool, word: bool) {
+        let Some(i) = self.editing else { return };
+        let keep = self.text_corner(i);
+        if let Some(Shape {
+            kind: Kind::Text { text, ext, .. },
+            ..
+        }) = self.shapes.get_mut(i)
+        {
+            let c = clamp_caret(text, self.caret);
+            let (a, b) = match (forward, word) {
+                (true, true) => (c, word_right(text, c)),
+                (true, false) => (c, text[c..].chars().next().map_or(c, |ch| c + ch.len_utf8())),
+                (false, true) => (word_left(text, c), c),
+                (false, false) => (text[..c].chars().next_back().map_or(c, |ch| c - ch.len_utf8()), c),
+            };
+            text.replace_range(a..b, "");
+            self.caret = a;
+            ext.set((0.0, 0.0));
+        }
+        self.refit_text(i, keep);
+    }
+
     fn set_tool(&mut self, t: Tool) {
         self.commit_text();
         self.selected = None;
@@ -954,6 +1409,24 @@ impl Overlay {
         self.ocr.mode = false;
         self.popup = Popup::None;
         self.hsv = self.cfg.style(t).color.to_hsv();
+    }
+
+    /// Closes the editor and starts a scrolling capture of the selection.
+    fn finish_scroll(&mut self) {
+        let Some(sel) = self.sel.filter(|r| !r.is_empty()) else {
+            return;
+        };
+        self.commit_text();
+        let (ox, oy) = (self.shot.ox, self.shot.oy);
+        let area = RectI::new(sel.l + ox, sel.t + oy, sel.r + ox, sel.b + oy);
+        self.done = Some(Done {
+            how: Finish::Scroll(area),
+            image: None,
+        });
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            let _ = PostMessageW(self.main, WM_APP_OVERLAY_DONE, WPARAM(0), LPARAM(0));
+        }
     }
 
     fn finish(&mut self, how: Finish) {
@@ -966,6 +1439,25 @@ impl Overlay {
                 } else {
                     None
                 };
+                let plain = self.shapes.is_empty()
+                    && blocks.map_or(true, |b| b.iter().all(|x| x.translated.is_none()));
+                if self.view.is_some() && plain && sel == self.shot.full() {
+                    // The whole tall picture, untouched: hand it over without a copy.
+                    let (w, h) = (self.shot.w as u32, self.shot.h as u32);
+                    self.done = Some(Done {
+                        how,
+                        image: Some(Image {
+                            w,
+                            h,
+                            bgra: std::mem::take(&mut self.shot.px),
+                        }),
+                    });
+                    unsafe {
+                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                        let _ = PostMessageW(self.main, WM_APP_OVERLAY_DONE, WPARAM(0), LPARAM(0));
+                    }
+                    return;
+                }
                 export::render(
                     &self.painter,
                     &self.shot,
@@ -1028,6 +1520,8 @@ impl Overlay {
                     self.finish(Finish::Copy)
                 }
             }
+            Hit::Share => self.finish(Finish::Share),
+            Hit::Scroll => self.finish_scroll(),
             Hit::Close => self.finish(Finish::Cancel),
             Hit::Done => self.finish(Finish::Save),
             Hit::Swatch(i) => {
@@ -1068,6 +1562,22 @@ impl Overlay {
                 let mut st = self.style();
                 st.shadow = !st.shadow;
                 self.set_style(st, true);
+            }
+            Hit::Align(a) => self.align_text(a),
+            Hit::Bold | Hit::Italic => {
+                let mut st = self.style();
+                if h == Hit::Bold {
+                    st.bold = !st.bold;
+                } else {
+                    st.italic = !st.italic;
+                }
+                self.set_style(st, true);
+            }
+            Hit::Turn(d) => {
+                if let Some(i) = self.text_target() {
+                    self.checkpoint();
+                    self.rotate_text(i, 15.0 * d as f32);
+                }
             }
             Hit::Panel => {}
         }
@@ -1169,6 +1679,11 @@ impl Overlay {
     // ---------------------------------------------------------------- input
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if self.view.is_some() {
+            if let Some(r) = self.handle_view(msg, wp, lp) {
+                return Some(r);
+            }
+        }
         match msg {
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
@@ -1264,6 +1779,29 @@ impl Overlay {
             IDC_CROSS
         } else if self.ui_hit(q).is_some() {
             IDC_ARROW
+        } else if let Some((i, g)) = self.text_grip_at(q) {
+            let a = self.shapes[i].text_box().map_or(0.0, |b| b.1);
+            match g {
+                TextGrip::Rotate | TextGrip::Delete => IDC_HAND,
+                TextGrip::Corner(_) | TextGrip::Side(_) => {
+                    // Direction the grip moves in: the diagonal, or across.
+                    let d = match g {
+                        TextGrip::Corner(c) if c % 2 == 0 => a + 45.0,
+                        TextGrip::Corner(_) => a - 45.0,
+                        _ => a,
+                    }
+                    .rem_euclid(180.0);
+                    if !(22.5..157.5).contains(&d) {
+                        IDC_SIZEWE
+                    } else if d < 67.5 {
+                        IDC_SIZENWSE
+                    } else if d < 112.5 {
+                        IDC_SIZENS
+                    } else {
+                        IDC_SIZENESW
+                    }
+                }
+            }
         } else if let Some(h) = self.sel_handle_at(q) {
             match h {
                 0 | 4 => IDC_SIZENWSE,
@@ -1318,6 +1856,66 @@ impl Overlay {
             self.popup = Popup::None;
             return;
         }
+        if let Some((i, grip)) = self.text_grip_at(q) {
+            match grip {
+                TextGrip::Rotate if double => {
+                    // Double click on the knob: straight again.
+                    self.checkpoint();
+                    if let Some(Shape {
+                        kind: Kind::Text { angle, .. },
+                        ..
+                    }) = self.shapes.get_mut(i)
+                    {
+                        *angle = 0.0;
+                    }
+                }
+                TextGrip::Rotate => {
+                    if let Some((b, a)) = self.shapes[i].text_box() {
+                        let grab = angle_of(q.sub(p(b.cx(), b.cy()))) - a;
+                        self.checkpoint();
+                        self.drag = Drag::Rotate { idx: i, grab };
+                    }
+                }
+                TextGrip::Corner(c) => {
+                    self.checkpoint();
+                    self.drag = Drag::TextScale {
+                        idx: i,
+                        corner: c,
+                        orig: Box::new(self.shapes[i].clone()),
+                    };
+                }
+                TextGrip::Side(_) if double => {
+                    // Double click on a side: as wide as the longest line again.
+                    let keep = self.shapes[i].text_corners().map(|c| c[0]);
+                    self.checkpoint();
+                    if let Some(Shape {
+                        kind: Kind::Text { wrap, .. },
+                        ..
+                    }) = self.shapes.get_mut(i)
+                    {
+                        *wrap = 0.0;
+                    }
+                    if let Some(k) = keep {
+                        self.pin_corner(i, 0, k);
+                    }
+                }
+                TextGrip::Side(side) => {
+                    self.checkpoint();
+                    self.drag = Drag::TextWrap {
+                        idx: i,
+                        side,
+                        orig: Box::new(self.shapes[i].clone()),
+                    };
+                }
+                TextGrip::Delete => {
+                    self.checkpoint();
+                    self.editing = None;
+                    self.selected = None;
+                    self.shapes.remove(i);
+                }
+            }
+            return;
+        }
         if let Some(h) = self.sel_handle_at(q) {
             self.drag = Drag::ResizeSel {
                 handle: h,
@@ -1353,13 +1951,20 @@ impl Overlay {
             if matches!(self.shapes[i].kind, Kind::Text { .. })
                 && (self.tool == Tool::Text || (self.tool == Tool::Select && double))
             {
+                let mut i = i;
                 if self.editing != Some(i) {
+                    let was = (self.editing, self.shapes.len());
                     self.commit_text();
+                    // An empty text before this one may have been dropped.
+                    if was.0.is_some_and(|e| e < i) && self.shapes.len() < was.1 {
+                        i -= 1;
+                    }
                     self.checkpoint();
                 }
                 let i = i.min(self.shapes.len().saturating_sub(1));
                 self.editing = Some(i);
                 self.selected = Some(i);
+                self.caret = self.caret_at_point(i, q);
                 self.drag = Drag::MoveShape { idx: i, last: q };
                 return;
             }
@@ -1411,12 +2016,15 @@ impl Overlay {
                                 at,
                                 text: String::new(),
                                 ext: Default::default(),
+                                angle: 0.0,
+                                wrap: 0.0,
                             },
                             style: st,
                         });
                         let i = self.shapes.len() - 1;
                         self.editing = Some(i);
                         self.selected = Some(i);
+                        self.caret = 0;
                     }
                     Tool::Counter => {
                         self.checkpoint();
@@ -1556,6 +2164,38 @@ impl Overlay {
                     s.drag_handle(handle, q);
                 }
             }
+            Drag::Rotate { idx, grab } => {
+                if let Some(s) = self.shapes.get_mut(idx) {
+                    if let Some((b, _)) = s.text_box() {
+                        let a = snap_angle(angle_of(q.sub(p(b.cx(), b.cy()))) - grab, shift);
+                        if let Kind::Text { angle, .. } = &mut s.kind {
+                            *angle = a;
+                        }
+                    }
+                }
+            }
+            Drag::TextScale { idx, corner, orig } => {
+                if let Some(s) = self.shapes.get_mut(idx) {
+                    s.scale_text(&orig, corner, q, Tool::Text.size_range());
+                }
+            }
+            Drag::TextWrap { idx, side, orig } => {
+                // The other edge stays where it is; lines wrap in the new width.
+                if let (Some((b, _)), Some(cs)) = (orig.text_box(), orig.text_corners()) {
+                    let lq = orig.text_local(q);
+                    let width = if side == 1 { lq.x - b.l } else { b.r - lq.x };
+                    let min = orig.style.width * 1.5;
+                    let w = (width - orig.text_pad() * 2.0).max(min).round();
+                    if let Some(s) = self.shapes.get_mut(idx) {
+                        *s = (*orig).clone();
+                        if let Kind::Text { wrap, .. } = &mut s.kind {
+                            *wrap = w;
+                        }
+                    }
+                    let k = if side == 1 { 0 } else { 1 };
+                    self.pin_corner(idx, k, cs[k]);
+                }
+            }
             Drag::Slider(h) => {
                 if let Some((r, _)) = self.layout().into_iter().find(|(_, x)| *x == h) {
                     self.slide(h, r);
@@ -1589,6 +2229,10 @@ impl Overlay {
                     }
                 }
                 self.phase = Phase::Editing;
+                if self.pick_scroll {
+                    self.finish_scroll();
+                    return;
+                }
                 self.after_sel_change();
             }
             Drag::MoveSel { .. } | Drag::ResizeSel { .. } => self.after_sel_change(),
@@ -1598,6 +2242,16 @@ impl Overlay {
                         self.checkpoint();
                         self.shapes.push(cur);
                     }
+                }
+            }
+            Drag::Rotate { idx, .. } | Drag::TextScale { idx, .. } | Drag::TextWrap { idx, .. } => {
+                if self.down_at.dist(q) < 0.5 {
+                    if let Some(prev) = self.undo.pop() {
+                        self.shapes = prev;
+                    }
+                } else if let Some(st) = self.shapes.get(idx).map(|s| s.style) {
+                    // New texts start at the size just chosen, as with the wheel.
+                    self.cfg.set_style(Tool::Text, st);
                 }
             }
             Drag::MoveShape { .. } | Drag::ShapeHandle { .. } => {
@@ -1634,6 +2288,24 @@ impl Overlay {
 
     fn on_wheel(&mut self, delta: f32) {
         if self.phase != Phase::Editing {
+            return;
+        }
+        if self.selected.is_some() {
+            // A burst of notches on a shape is one undo step.
+            if self
+                .wheel_at
+                .is_none_or(|t| t.elapsed() > Duration::from_millis(800))
+            {
+                self.checkpoint();
+            }
+            self.wheel_at = Some(Instant::now());
+        }
+        if key_down(VK_MENU) {
+            // Alt+wheel turns a text: 5 degrees a notch, 1 with Shift.
+            if let Some(i) = self.text_target() {
+                let step = if key_down(VK_SHIFT) { 1.0 } else { 5.0 };
+                self.rotate_text(i, step * delta);
+            }
             return;
         }
         let mut st = self.style();
@@ -1674,7 +2346,7 @@ impl Overlay {
         let vk = VIRTUAL_KEY(vk);
 
         // Typing into a text shape.
-        if let Some(i) = self.editing {
+        if self.editing.is_some() {
             match vk {
                 VK_ESCAPE => {
                     self.commit_text();
@@ -1684,35 +2356,17 @@ impl Overlay {
                     self.commit_text();
                     return;
                 }
-                VK_BACK => {
-                    if let Some(Shape {
-                        kind: Kind::Text { text, ext, .. },
-                        ..
-                    }) = self.shapes.get_mut(i)
-                    {
-                        if ctrl {
-                            let t = text.trim_end().to_string();
-                            let cut = t
-                                .rfind(|c: char| c.is_whitespace())
-                                .map(|x| x + 1)
-                                .unwrap_or(0);
-                            text.truncate(cut);
-                        } else {
-                            text.pop();
-                        }
-                        ext.set((0.0, 0.0));
-                    }
+                VK_BACK | VK_DELETE => {
+                    self.erase(vk == VK_DELETE, ctrl);
+                    return;
+                }
+                VK_LEFT | VK_RIGHT | VK_HOME | VK_END | VK_UP | VK_DOWN => {
+                    self.move_caret(vk, ctrl);
                     return;
                 }
                 _ if ctrl && vk.0 == 'V' as u16 => {
                     if let Some(t) = encode::paste_text(self.hwnd) {
-                        if let Some(Shape {
-                            kind: Kind::Text { text, .. },
-                            ..
-                        }) = self.shapes.get_mut(i)
-                        {
-                            text.push_str(&t.replace("\r\n", "\n"));
-                        }
+                        self.insert_text(&t.replace("\r\n", "\n"));
                     }
                     return;
                 }
@@ -1760,6 +2414,12 @@ impl Overlay {
                 VK_DOWN => self.move_cursor(0, 1),
                 _ => {}
             }
+            if self.pick_scroll && self.phase == Phase::Editing {
+                self.finish_scroll();
+            }
+            return;
+        }
+        if self.view.is_some() && self.view_key(vk, ctrl) {
             return;
         }
 
@@ -1789,12 +2449,24 @@ impl Overlay {
             VK_RIGHT => self.nudge(step, 0),
             VK_UP => self.nudge(0, -step),
             VK_DOWN => self.nudge(0, step),
+            VK_OEM_4 | VK_OEM_6 if ctrl && self.text_target().is_some() => {
+                // Ctrl+[ / Ctrl+]: turn a text by 15 degrees, 1 with Shift.
+                let i = self.text_target().unwrap_or(0);
+                let d = if shift { 1.0 } else { 15.0 };
+                self.checkpoint();
+                self.rotate_text(i, if vk == VK_OEM_4 { -d } else { d });
+            }
             VK_OEM_4 => self.on_wheel(-1.0),
             VK_OEM_6 => self.on_wheel(1.0),
             _ if ctrl => match vk {
+                VK_D => self.duplicate(),
+                VK_L => self.align_text(Align::Left),
+                VK_E => self.align_text(Align::Center),
+                VK_R => self.align_text(Align::Right),
                 VK_Z if shift => self.redo_step(),
                 VK_Z => self.undo_step(),
                 VK_Y => self.redo_step(),
+                VK_C if shift && crate::share::enabled(&self.cfg) => self.finish(Finish::Share),
                 VK_C => {
                     if self.ocr.mode || (self.tr.on && self.ocr_valid()) {
                         self.copy_text()
@@ -1844,7 +2516,9 @@ impl Overlay {
     }
 
     fn on_char(&mut self, c: u16) {
-        let Some(i) = self.editing else { return };
+        if self.editing.is_none() {
+            return;
+        }
         let ch = if (0xD800..0xDC00).contains(&c) {
             self.surrogate = Some(c);
             return;
@@ -1861,13 +2535,8 @@ impl Overlay {
         if (ch as u32) < 32 && ch != '\n' {
             return;
         }
-        if let Some(Shape {
-            kind: Kind::Text { text, .. },
-            ..
-        }) = self.shapes.get_mut(i)
-        {
-            text.push(ch);
-        }
+        let mut b = [0u8; 4];
+        self.insert_text(ch.encode_utf8(&mut b));
     }
 
     // ---------------------------------------------------------------- rendering
@@ -1888,22 +2557,31 @@ impl Overlay {
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
+            let (pw, ph) = match self.view {
+                Some(v) => (v.ww as u32, v.wh as u32),
+                None => (self.shot.w as u32, self.shot.h as u32),
+            };
             let hp = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd: self.hwnd,
                 pixelSize: D2D_SIZE_U {
-                    width: self.shot.w as u32,
-                    height: self.shot.h as u32,
+                    width: pw,
+                    height: ph,
                 },
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
             let rt = self.painter.d2d.CreateHwndRenderTarget(&props, &hp)?;
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            self.base = Some(export::make_bitmap(
-                &rt,
-                &self.shot.px,
-                self.shot.w,
-                self.shot.h,
-            )?);
+            self.tiles.clear();
+            self.base = if self.view.is_some() {
+                None
+            } else {
+                Some(export::make_bitmap(
+                    &rt,
+                    &self.shot.px,
+                    self.shot.w,
+                    self.shot.h,
+                )?)
+            };
             self.dashed = self.painter.dashed().ok();
             self.fx_bmp.clear();
             self.rt = Some(rt);
@@ -1919,10 +2597,23 @@ impl Overlay {
             Some(r) => (**r).clone(),
             None => return,
         };
+        let view = self.view;
         unsafe {
             rt.BeginDraw();
             rt.SetTransform(&Matrix3x2::identity());
             let full = self.shot.full().f();
+            if let Some(v) = view {
+                rt.Clear(Some(&rgba(0.043, 0.047, 0.055, 1.0)));
+                rt.SetTransform(&Matrix3x2 {
+                    M11: v.k,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: v.k,
+                    M31: v.tx,
+                    M32: v.ty,
+                });
+                self.draw_tiles(&rt, v);
+            }
             if let Some(b) = &self.base {
                 rt.DrawBitmap(
                     b,
@@ -1934,11 +2625,18 @@ impl Overlay {
             }
         }
         let _ = self.draw_scene(&rt);
+        if view.is_some() {
+            unsafe {
+                rt.SetTransform(&Matrix3x2::identity());
+            }
+            let _ = self.draw_view_chrome(&rt);
+        }
         unsafe {
             if let Err(e) = rt.EndDraw(None, None) {
                 if e.code() == D2DERR_RECREATE_TARGET {
                     self.rt = None;
                     self.base = None;
+                    self.tiles.clear();
                     self.fx_bmp.clear();
                     self.invalidate();
                 }
@@ -1974,6 +2672,7 @@ impl Overlay {
             }
             // Shapes (and the one being drawn).
             {
+                let caret = self.editing.map(|i| (i, self.caret16()));
                 let Overlay {
                     painter,
                     shapes,
@@ -1981,25 +2680,32 @@ impl Overlay {
                     fx,
                     fx_bmp,
                     shot,
-                    editing,
                     ..
                 } = self;
-                let mut src = |tool: Tool, st: u32| -> Option<ID2D1Bitmap> {
-                    let key = (tool, FxCache::quantize(tool, st));
-                    if let Some(b) = fx_bmp.get(&key) {
-                        if !fx.evicted(&key) {
-                            return Some(b.clone());
+                let mut src = |tool: Tool, st: u32, r: RectF| -> Vec<(ID2D1Bitmap, RectF)> {
+                    let mut out = Vec::new();
+                    for band in FxCache::bands(shot, r) {
+                        let key = (tool, FxCache::quantize(tool, st), band);
+                        let br = FxCache::band_rect(shot, band);
+                        if let Some(b) = fx_bmp.get(&key) {
+                            if !fx.evicted(&key) {
+                                out.push((b.clone(), br.f()));
+                                continue;
+                            }
                         }
+                        let px = fx.get(shot, tool, st, band);
+                        let Ok(b) = export::make_bitmap(rt, px, br.w(), br.h()) else {
+                            continue;
+                        };
+                        fx_bmp.retain(|k, _| fx.cpu.contains_key(k));
+                        fx_bmp.insert(key, b.clone());
+                        out.push((b, br.f()));
                     }
-                    let px = fx.get(shot, tool, st);
-                    let b = export::make_bitmap(rt, px, shot.w, shot.h).ok()?;
-                    fx_bmp.retain(|k, _| fx.cpu.contains_key(k));
-                    fx_bmp.insert(key, b.clone());
-                    Some(b)
+                    out
                 };
-                painter.draw_shapes(rt, shapes, &mut src, *editing);
+                painter.draw_shapes(rt, shapes, &mut src, caret);
                 if let Some(c) = current.as_ref() {
-                    let _ = painter.draw_shape(rt, c, &mut src, false);
+                    let _ = painter.draw_shape(rt, c, &mut src, None);
                 }
             }
             // Recognised words.
@@ -2090,7 +2796,9 @@ impl Overlay {
                             }
                         }
                     }
-                    if let Some(i) = self.selected {
+                    if let Some(i) = self.text_target() {
+                        self.draw_text_frame(rt, i, s, &acc, &white)?;
+                    } else if let Some(i) = self.selected {
                         if let Some(sh) = self.shapes.get(i) {
                             let b = sh.bounds().inflate(3.0);
                             unsafe {
@@ -2181,14 +2889,204 @@ impl Overlay {
             .unwrap_or((0.0, 0.0))
     }
 
+    /// Frame of the selected text: thin turned box, round grips on three corners
+    /// (font size), bars on the sides (wrap width), a cross on the top-left corner
+    /// (delete) and a turn knob under the box. Shows the angle or size while dragging.
+    fn draw_text_frame(
+        &self,
+        rt: &ID2D1RenderTarget,
+        i: usize,
+        s: f32,
+        _acc: &ID2D1SolidColorBrush,
+        _white: &ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let Some(sh) = self.shapes.get(i) else {
+            return Ok(());
+        };
+        let Some((b, a)) = sh.text_box() else {
+            return Ok(());
+        };
+        let line = self.painter.brush(rt, rgba(0.93, 0.94, 0.95, 0.92))?;
+        let under = self.painter.brush(rt, rgba(0.0, 0.0, 0.0, 0.28))?;
+        let knob_bg = self.painter.brush(rt, rgba(0.97, 0.97, 0.98, 1.0))?;
+        let ink = self.painter.brush(rt, rgba(0.12, 0.13, 0.15, 1.0))?;
+        let grey = self.painter.brush(rt, rgba(0.55, 0.56, 0.58, 0.95))?;
+        let moving = matches!(self.drag, Drag::MoveShape { .. });
+        let hover = if matches!(self.drag, Drag::None) {
+            self.text_grip_at(self.mouse).map(|g| g.1)
+        } else {
+            None
+        };
+        let none = None::<&ID2D1StrokeStyle>;
+        unsafe {
+            let mut m0 = Matrix3x2::default();
+            rt.GetTransform(&mut m0);
+            rt.SetTransform(&(Matrix3x2::rotation(a, b.cx(), b.cy()) * m0));
+            rt.DrawRectangle(&rc(b), &under, 2.6 * s, none);
+            rt.DrawRectangle(&rc(b), &line, 1.1 * s, none);
+            if !moving {
+                // Side bars, drawn in the turned frame so they follow the edges.
+                for x in [b.l, b.r] {
+                    let bar = RectF::xywh(x - 2.5 * s, b.cy() - 8.0 * s, 5.0 * s, 16.0 * s);
+                    rt.FillRoundedRectangle(&rrect(bar, 2.5 * s), &knob_bg);
+                    rt.DrawRoundedRectangle(&rrect(bar, 2.5 * s), &under, 1.0 * s, none);
+                }
+            }
+            rt.SetTransform(&m0);
+        }
+        let cs = sh.text_corners().unwrap_or_default();
+        if !moving {
+            for c in &cs[1..] {
+                let e = D2D1_ELLIPSE {
+                    point: pt(*c),
+                    radiusX: 5.0 * s,
+                    radiusY: 5.0 * s,
+                };
+                unsafe {
+                    rt.FillEllipse(&e, &knob_bg);
+                    rt.DrawEllipse(&e, &under, 1.0 * s, none);
+                }
+            }
+        }
+        // Delete cross on the top-left corner.
+        let r = if hover == Some(TextGrip::Delete) { 9.5 } else { 8.5 } * s;
+        let e = D2D1_ELLIPSE {
+            point: pt(cs[0]),
+            radiusX: r,
+            radiusY: r,
+        };
+        let x = 3.2 * s;
+        let red = self.painter.brush(rt, rgba(0.86, 0.22, 0.27, 1.0))?;
+        unsafe {
+            rt.FillEllipse(
+                &e,
+                if hover == Some(TextGrip::Delete) {
+                    &red
+                } else {
+                    &grey
+                },
+            );
+            rt.DrawEllipse(&e, &line, 1.2 * s, none);
+            for (dx, dy) in [(x, x), (x, -x)] {
+                rt.DrawLine(
+                    pt(cs[0].add(p(-dx, -dy))),
+                    pt(cs[0].add(p(dx, dy))),
+                    &knob_bg,
+                    1.6 * s,
+                    &self.painter.round,
+                );
+            }
+        }
+        // Turn knob under the box.
+        if let Some((_, knob)) = sh.rot_handle(self.knob_off()) {
+            let r = if hover == Some(TextGrip::Rotate) { 11.0 } else { 10.0 } * s;
+            let e = D2D1_ELLIPSE {
+                point: pt(knob),
+                radiusX: r,
+                radiusY: r,
+            };
+            unsafe {
+                rt.FillEllipse(&e, &knob_bg);
+                rt.DrawEllipse(&e, &under, 1.0 * s, none);
+            }
+            self.turn_glyph(rt, knob, 5.2 * s, &ink, 1.5 * s, 0)?;
+        }
+        let text = match self.drag {
+            Drag::Rotate { idx, .. } if idx == i => format!("{}\u{00B0}", a.round() as i32),
+            Drag::TextScale { idx, .. } if idx == i => {
+                format!("{} px", sh.style.width.round() as i32)
+            }
+            Drag::TextWrap { idx, .. } if idx == i => format!("{} px wide", b.w().round() as i32),
+            _ => return Ok(()),
+        };
+        let fs = 12.0 * s;
+        let (tw, th) = self.measure(&text, fs, true);
+        let (pw, ph) = (tw + 16.0 * s, th + 8.0 * s);
+        let at = self.mouse.add(p(14.0 * s, 14.0 * s));
+        self.pill(rt, RectF::xywh(at.x, at.y, pw, ph), 0.88)?;
+        self.label(
+            rt,
+            &text,
+            p(at.x + 8.0 * s, at.y + 4.0 * s),
+            fs,
+            rgba(1.0, 1.0, 1.0, 0.95),
+            true,
+        )?;
+        Ok(())
+    }
+
+    /// Turning arrows: `dir` 0 = two arcs (the knob), -1 / 1 = one arc turning
+    /// left / right (toolbar).
+    fn turn_glyph(
+        &self,
+        rt: &ID2D1RenderTarget,
+        c: P,
+        r: f32,
+        br: &ID2D1SolidColorBrush,
+        lw: f32,
+        dir: i32,
+    ) -> Result<()> {
+        let arcs: &[(f32, f32)] = match dir {
+            0 => &[(-160.0, -25.0), (20.0, 155.0)],
+            1 => &[(-200.0, 20.0)],
+            _ => &[(200.0, -20.0)],
+        };
+        let at = |deg: f32| c.add(rot(p(r, 0.0), deg));
+        for &(a0, a1) in arcs {
+            let cw = a1 > a0;
+            let g = unsafe { self.painter.d2d.CreatePathGeometry()? };
+            unsafe {
+                let sk = g.Open()?;
+                sk.BeginFigure(pt(at(a0)), D2D1_FIGURE_BEGIN_HOLLOW);
+                sk.AddArc(&D2D1_ARC_SEGMENT {
+                    point: pt(at(a1)),
+                    size: D2D_SIZE_F {
+                        width: r,
+                        height: r,
+                    },
+                    rotationAngle: 0.0,
+                    sweepDirection: if cw {
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE
+                    } else {
+                        D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE
+                    },
+                    arcSize: if (a1 - a0).abs() > 180.0 {
+                        D2D1_ARC_SIZE_LARGE
+                    } else {
+                        D2D1_ARC_SIZE_SMALL
+                    },
+                });
+                sk.EndFigure(D2D1_FIGURE_END_OPEN);
+                sk.Close()?;
+                rt.DrawGeometry(&g, br, lw, &self.painter.round);
+            }
+            // Arrow head along the direction of travel at the end of the arc.
+            let end = at(a1);
+            let t = rot(p(0.0, if cw { 1.0 } else { -1.0 }), a1);
+            let hl = r * 0.62;
+            for side in [-38.0f32, 38.0] {
+                let back = rot(t, 180.0 + side).mul(hl);
+                unsafe {
+                    rt.DrawLine(pt(end), pt(end.add(back)), br, lw, &self.painter.round);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn size_label(&self, rt: &ID2D1RenderTarget, r: RectF, s: f32) -> Result<()> {
         let text = format!("{} \u{00D7} {}", r.w().round() as i32, r.h().round() as i32);
         let fs = 12.0 * s;
         let (tw, th) = self.measure(&text, fs, true);
         let (pw, ph) = (tw + 16.0 * s, th + 8.0 * s);
+        let top = if self.view.is_some() {
+            self.visible().t
+        } else {
+            0.0
+        };
         let mut y = r.t - ph - 6.0 * s;
-        if y < 2.0 {
-            y = r.t + 6.0 * s;
+        if y < top + 2.0 {
+            y = r.t.max(top) + 6.0 * s;
         }
         let x = r.l.max(2.0);
         self.pill(rt, RectF::xywh(x, y, pw, ph), 0.88)?;
@@ -2213,10 +3111,18 @@ impl Overlay {
         else {
             return Ok(());
         };
-        let text = "Drag to select   \u{2022}   Click a window   \u{2022}   Space: full screen   \u{2022}   C: copy colour   \u{2022}   Esc: cancel";
+        let text = if self.pick_scroll {
+            "Long screenshot: select the area or click a window, then scroll it down yourself   \u{2022}   Esc: cancel"
+        } else {
+            "Drag to select   \u{2022}   Click a window   \u{2022}   Space: full screen   \u{2022}   C: copy colour   \u{2022}   Esc: cancel"
+        };
         let fs = 13.0 * s;
         let (tw, th) = self.measure(text, fs, false);
-        let r = m.rect.f();
+        let r = if self.view.is_some() {
+            self.visible()
+        } else {
+            m.rect.f()
+        };
         let (pw, ph) = (tw + 28.0 * s, th + 14.0 * s);
         let x = r.cx() - pw * 0.5;
         let y = r.t + 22.0 * s;
@@ -2630,6 +3536,9 @@ impl Overlay {
                         Hit::Translate => self.tr.on,
                         Hit::Shadow => st.shadow,
                         Hit::Fill => st.fill != Fill::None,
+                        Hit::Align(a) => st.align == *a,
+                        Hit::Bold => st.bold,
+                        Hit::Italic => st.italic,
                         Hit::Lang => self.popup == Popup::Lang,
                         _ => false,
                     };
@@ -3132,6 +4041,49 @@ impl Overlay {
                     rs,
                 );
             },
+            Hit::Scroll => {
+                // A tall page with an arrow running down it.
+                unsafe {
+                    rt.DrawRoundedRectangle(
+                        &rrect(
+                            RectF::new(cx - 6.5 * k, cy - 8.5 * k, cx + 6.5 * k, cy + 8.5 * k),
+                            2.5 * k,
+                        ),
+                        &br,
+                        lw,
+                        rs,
+                    );
+                }
+                line((0.0, -4.5), (0.0, 4.2), lw);
+                poly(&[(-3.0, 1.4), (0.0, 4.4), (3.0, 1.4)], false, false, lw)?;
+            }
+            Hit::Share => unsafe {
+                // Two chain links at 45 degrees.
+                let mut old = Matrix3x2::default();
+                rt.GetTransform(&mut old);
+                let (c, sn) = (std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2);
+                let rot = Matrix3x2 {
+                    M11: c,
+                    M12: sn,
+                    M21: -sn,
+                    M22: c,
+                    M31: cx - c * cx + sn * cy,
+                    M32: cy - sn * cx - c * cy,
+                };
+                rt.SetTransform(&(rot * old));
+                for (l, r) in [(-9.0, 1.5), (-1.5, 9.0)] {
+                    rt.DrawRoundedRectangle(
+                        &rrect(
+                            RectF::new(cx + l * k, cy - 3.4 * k, cx + r * k, cy + 3.4 * k),
+                            3.4 * k,
+                        ),
+                        &br,
+                        lw,
+                        rs,
+                    );
+                }
+                rt.SetTransform(&old);
+            },
             Hit::Close => {
                 line((-6.0, -6.0), (6.0, 6.0), 2.0 * k);
                 line((6.0, -6.0), (-6.0, 6.0), 2.0 * k);
@@ -3158,6 +4110,37 @@ impl Overlay {
                     rt.DrawRoundedRectangle(&rrect(b, 3.0 * k), &br, lw, rs);
                 }
             }
+            Hit::Align(a) => {
+                // Lines of different lengths lined up on one side.
+                for (i, len) in [14.0f32, 9.0, 14.0, 9.0].iter().enumerate() {
+                    let y = -6.0 + i as f32 * 4.0;
+                    let x0 = match a {
+                        Align::Left => -7.0,
+                        Align::Center => -len * 0.5,
+                        Align::Right => 7.0 - len,
+                    };
+                    line((x0, y), (x0 + len, y), 1.6 * k);
+                }
+            }
+            Hit::Bold => {
+                let f = self.painter.format(15.0 * k, DWRITE_FONT_WEIGHT_BOLD)?;
+                let l = self.painter.layout("B", &f, 100.0 * k, 100.0 * k)?;
+                let (tw, th) = Painter::metrics(&l);
+                unsafe {
+                    rt.DrawTextLayout(
+                        pt(p(cx - tw * 0.5, cy - th * 0.5)),
+                        &l,
+                        &br,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+            }
+            Hit::Italic => {
+                line((2.6, -6.5), (-2.6, 6.5), 1.7 * k);
+                line((-0.4, -6.5), (5.6, -6.5), 1.7 * k);
+                line((-5.6, 6.5), (0.4, 6.5), 1.7 * k);
+            }
+            Hit::Turn(d) => self.turn_glyph(rt, p(cx, cy), 6.0 * k, &br, 1.7 * k, d)?,
             Hit::Shadow => unsafe {
                 let b = RectF::new(cx - 7.0 * k, cy - 7.0 * k, cx + 4.0 * k, cy + 4.0 * k);
                 rt.FillRoundedRectangle(
@@ -3209,4 +4192,826 @@ pub fn lang_name(code: &str) -> &'static str {
         "id" => "Indonesian",
         _ => "",
     }
+}
+
+// ---------------------------------------------------------------- tall view
+
+/// The editor for tall pictures (scrolling capture): the window shows the picture
+/// scaled by k and scrolled. Everything (picture, shapes, toolbar) is drawn in
+/// image pixels under one transform, the UI at 1/k so that it keeps its size;
+/// mouse input is mapped back to image pixels on arrival.
+impl Overlay {
+    fn to_img(&self, q: P) -> P {
+        match self.view {
+            Some(v) => p((q.x - v.tx) / v.k, (q.y - v.ty) / v.k),
+            None => q,
+        }
+    }
+
+    /// The part of the picture the window shows, in image pixels.
+    fn visible(&self) -> RectF {
+        match self.view {
+            Some(v) => RectF::from_pts(self.to_img(p(0.0, 0.0)), self.to_img(p(v.ww, v.wh))),
+            None => self.shot.full().f(),
+        }
+    }
+
+    /// Margins around the picture in window pixels: top, bottom (room for the
+    /// toolbar under the end of the picture), sides.
+    fn view_pads(v: &View) -> (f32, f32, f32) {
+        (16.0 * v.ui, 104.0 * v.ui, 16.0 * v.ui)
+    }
+
+    /// Zoom that shows the whole picture.
+    fn fit_k(&self) -> f32 {
+        let Some(v) = self.view else { return 1.0 };
+        let (top, bottom, side) = Self::view_pads(&v);
+        ((v.ww - 2.0 * side) / self.shot.w as f32)
+            .min((v.wh - top - bottom) / self.shot.h as f32)
+            .min(1.0)
+    }
+
+    fn clamp_view(&mut self) {
+        let (iw, ih) = (self.shot.w as f32, self.shot.h as f32);
+        let fit = self.fit_k();
+        let Some(v) = self.view.as_mut() else { return };
+        v.k = v.k.clamp(fit.max(0.01), 8.0);
+        let (top, bottom, side) = Self::view_pads(v);
+        let (w, h) = (iw * v.k, ih * v.k);
+        v.tx = if w + 2.0 * side <= v.ww {
+            ((v.ww - w) * 0.5).round()
+        } else {
+            v.tx.clamp(v.ww - side - w, side)
+        };
+        v.ty = if h + top + bottom <= v.wh {
+            top
+        } else {
+            v.ty.clamp(v.wh - bottom - h, top)
+        };
+    }
+
+    /// New zoom, keeping the picture point under `at` (window pixels) in place.
+    fn zoom_at(&mut self, k: f32, at: P) {
+        let img = self.to_img(at);
+        if let Some(v) = self.view.as_mut() {
+            v.k = k;
+        }
+        self.clamp_view();
+        if let Some(v) = self.view.as_mut() {
+            v.tx = at.x - img.x * v.k;
+            v.ty = at.y - img.y * v.k;
+        }
+        self.clamp_view();
+        self.after_view_change();
+    }
+
+    fn pan_by(&mut self, dx: f32, dy: f32) {
+        if let Some(v) = self.view.as_mut() {
+            v.tx += dx;
+            v.ty += dy;
+        }
+        self.clamp_view();
+        self.after_view_change();
+    }
+
+    /// The image point under the mouse changed: update hover and the drag in progress.
+    fn after_view_change(&mut self) {
+        let q = self.to_img(self.win_mouse);
+        self.on_move(q);
+        self.invalidate();
+    }
+
+    /// Keys of the tall view. Returns true when the key was used.
+    fn view_key(&mut self, vk: VIRTUAL_KEY, ctrl: bool) -> bool {
+        let Some(v) = self.view else { return false };
+        let (top, bottom, _) = Self::view_pads(&v);
+        let page = (v.wh - top - bottom) * 0.9;
+        let center = p(v.ww * 0.5, v.wh * 0.5);
+        match vk {
+            VK_NEXT => self.pan_by(0.0, -page),
+            VK_PRIOR => self.pan_by(0.0, page),
+            VK_HOME if ctrl || self.selected.is_none() => self.pan_by(0.0, f32::MAX / 4.0),
+            VK_END if ctrl || self.selected.is_none() => self.pan_by(0.0, -f32::MAX / 4.0),
+            VK_0 | VK_NUMPAD0 if ctrl => self.zoom_at(self.fit_k(), center),
+            VK_1 | VK_NUMPAD1 if ctrl => self.zoom_at(1.0, center),
+            VK_OEM_PLUS | VK_ADD if ctrl => self.zoom_at(v.k * 1.25, center),
+            VK_OEM_MINUS | VK_SUBTRACT if ctrl => self.zoom_at(v.k / 1.25, center),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Scroll bar track and thumb (window pixels), when the picture is taller
+    /// than the window.
+    fn scrollbar(&self) -> Option<(RectF, RectF)> {
+        let v = self.view?;
+        let (top, bottom, _) = Self::view_pads(&v);
+        let content = self.shot.h as f32 * v.k + top + bottom;
+        if content <= v.wh + 0.5 {
+            return None;
+        }
+        let m = 6.0 * v.ui;
+        let track = RectF::new(v.ww - 12.0 * v.ui, m, v.ww - 5.0 * v.ui, v.wh - m);
+        let th = (track.h() * v.wh / content).max(32.0 * v.ui).min(track.h());
+        let frac = ((top - v.ty) / (content - v.wh)).clamp(0.0, 1.0);
+        let t = track.t + frac * (track.h() - th);
+        Some((track, RectF::new(track.l, t, track.r, t + th)))
+    }
+
+    fn zoom_text(&self) -> String {
+        let k = self.view.map(|v| v.k).unwrap_or(1.0);
+        format!(
+            "{}%   {} \u{00D7} {}",
+            (k * 100.0).round() as i32,
+            self.shot.w,
+            self.shot.h
+        )
+    }
+
+    fn zoom_rect(&self) -> RectF {
+        let Some(v) = self.view else {
+            return RectF::default();
+        };
+        let fs = 12.0 * v.ui;
+        let (tw, th) = self.measure(&self.zoom_text(), fs, true);
+        let (pw, ph) = (tw + 22.0 * v.ui, th + 10.0 * v.ui);
+        RectF::xywh(v.ww - 24.0 * v.ui - pw, 14.0 * v.ui, pw, ph)
+    }
+
+    /// View controls under `q` (window pixels).
+    fn chrome_at(&self, q: P) -> Option<Chrome> {
+        let v = self.view?;
+        if self.zoom_rect().contains(q) {
+            return Some(Chrome::Zoom);
+        }
+        let (track, thumb) = self.scrollbar()?;
+        // Wider than drawn, easy to hit.
+        let zone = RectF::new(track.l - 6.0 * v.ui, track.t, v.ww, track.b);
+        if !zone.contains(q) {
+            return None;
+        }
+        Some(if q.y < thumb.t {
+            Chrome::TrackUp
+        } else if q.y > thumb.b {
+            Chrome::TrackDown
+        } else {
+            Chrome::Thumb
+        })
+    }
+
+    fn drag_active(&self) -> bool {
+        !matches!(
+            self.drag,
+            Drag::None | Drag::Slider(_) | Drag::Picker(_)
+        )
+    }
+
+    /// While dragging near the top or bottom edge, the picture scrolls.
+    fn edge_scroll(&mut self) {
+        let Some(v) = self.view else { return };
+        let zone = 44.0 * v.ui;
+        let y = self.win_mouse.y;
+        let speed = if y < zone {
+            (zone - y).min(zone * 2.0) * 0.5
+        } else if y > v.wh - zone {
+            -(y - (v.wh - zone)).min(zone * 2.0) * 0.5
+        } else {
+            0.0
+        };
+        if speed == 0.0 || !self.drag_active() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_EDGE);
+            }
+            return;
+        }
+        self.pan_by(0.0, speed);
+    }
+
+    fn handle_view(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let v = self.view?;
+        let at = || {
+            let (x, y) = lparam_xy(lp);
+            p(x as f32, y as f32)
+        };
+        match msg {
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                let (x, y) = lparam_xy(lp);
+                let mut pt = POINT { x, y };
+                unsafe {
+                    let _ = ScreenToClient(self.hwnd, &mut pt);
+                }
+                let q = p(pt.x as f32, pt.y as f32);
+                self.win_mouse = q;
+                let step = 110.0 * v.ui * delta;
+                if msg == WM_MOUSEHWHEEL {
+                    self.pan_by(-step, 0.0);
+                } else if key_down(VK_CONTROL) {
+                    self.zoom_at(v.k * 1.15f32.powf(delta), q);
+                } else if key_down(VK_SHIFT) {
+                    self.pan_by(step, 0.0);
+                } else {
+                    self.pan_by(0.0, step);
+                }
+                Some(LRESULT(0))
+            }
+            WM_MBUTTONDOWN => {
+                let q = at();
+                self.vdrag = VDrag::Pan {
+                    at: q,
+                    tx: v.tx,
+                    ty: v.ty,
+                };
+                unsafe {
+                    SetCapture(self.hwnd);
+                    if let Ok(c) = LoadCursorW(None, IDC_SIZEALL) {
+                        SetCursor(c);
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_MBUTTONUP => {
+                self.vdrag = VDrag::None;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == TIMER_EDGE => {
+                self.edge_scroll();
+                Some(LRESULT(0))
+            }
+            WM_SETCURSOR => {
+                let id = match self.vdrag {
+                    VDrag::Pan { .. } => IDC_SIZEALL,
+                    VDrag::Thumb { .. } => IDC_ARROW,
+                    VDrag::None if matches!(self.drag, Drag::None) => match self.chrome_at(self.win_mouse) {
+                        Some(Chrome::Zoom) => IDC_HAND,
+                        Some(_) => IDC_ARROW,
+                        None => return None,
+                    },
+                    VDrag::None => return None,
+                };
+                unsafe {
+                    if let Ok(c) = LoadCursorW(None, id) {
+                        SetCursor(c);
+                    }
+                }
+                Some(LRESULT(1))
+            }
+            WM_MOUSEMOVE => {
+                let q = at();
+                let moved = q != self.win_mouse;
+                self.win_mouse = q;
+                match self.vdrag {
+                    VDrag::Pan { at, tx, ty } => {
+                        if let Some(v) = self.view.as_mut() {
+                            v.tx = tx + q.x - at.x;
+                            v.ty = ty + q.y - at.y;
+                        }
+                        self.clamp_view();
+                        self.invalidate();
+                    }
+                    VDrag::Thumb { grab } => {
+                        if let Some((track, thumb)) = self.scrollbar() {
+                            let (top, bottom, _) = Self::view_pads(&v);
+                            let content = self.shot.h as f32 * v.k + top + bottom;
+                            let room = (track.h() - thumb.h()).max(1.0);
+                            let frac = ((q.y - grab - track.t) / room).clamp(0.0, 1.0);
+                            if let Some(v) = self.view.as_mut() {
+                                v.ty = top - frac * (content - v.wh);
+                            }
+                            self.clamp_view();
+                            self.invalidate();
+                        }
+                    }
+                    VDrag::None => {
+                        let img = self.to_img(q);
+                        self.on_move(img);
+                        if moved && matches!(self.drag, Drag::None) {
+                            // Hover over the zoom pill / scroll bar.
+                            self.invalidate();
+                        }
+                        let zone = 44.0 * v.ui;
+                        if self.drag_active() && (q.y < zone || q.y > v.wh - zone) {
+                            unsafe {
+                                SetTimer(self.hwnd, TIMER_EDGE, 16, None);
+                            }
+                        }
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                let q = at();
+                self.win_mouse = q;
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+                match self.chrome_at(q) {
+                    Some(Chrome::Zoom) => {
+                        let fit = self.fit_k();
+                        let k = if (v.k - 1.0).abs() < 0.01 && fit < 0.99 {
+                            fit
+                        } else {
+                            1.0
+                        };
+                        self.zoom_at(k, p(v.ww * 0.5, v.wh * 0.5));
+                    }
+                    Some(Chrome::Thumb) => {
+                        if let Some((_, thumb)) = self.scrollbar() {
+                            self.vdrag = VDrag::Thumb { grab: q.y - thumb.t };
+                        }
+                    }
+                    Some(Chrome::TrackUp) | Some(Chrome::TrackDown) => {
+                        let (top, bottom, _) = Self::view_pads(&v);
+                        let page = (v.wh - top - bottom) * 0.9;
+                        let up = self.chrome_at(q) == Some(Chrome::TrackUp);
+                        self.pan_by(0.0, if up { page } else { -page });
+                    }
+                    None => {
+                        let img = self.to_img(q);
+                        self.on_down(img);
+                    }
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP => {
+                let q = at();
+                self.win_mouse = q;
+                unsafe {
+                    let _ = ReleaseCapture();
+                    let _ = KillTimer(self.hwnd, TIMER_EDGE);
+                }
+                if self.vdrag != VDrag::None {
+                    self.vdrag = VDrag::None;
+                } else {
+                    let img = self.to_img(q);
+                    self.on_up(img);
+                }
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            // The tall picture does not depend on the screen layout: keep it.
+            WM_DISPLAYCHANGE => Some(LRESULT(0)),
+            _ => None,
+        }
+    }
+
+    /// Draws the visible part of the tall picture (current transform: the view).
+    /// GPU bitmaps are made for visible tiles only and dropped when far away.
+    fn draw_tiles(&mut self, rt: &ID2D1RenderTarget, v: View) {
+        let (w, h) = (self.shot.w, self.shot.h);
+        let n = ((h + TILE - 1) / TILE).max(1) as usize;
+        if self.tiles.len() != n {
+            self.tiles = vec![None; n];
+        }
+        let vis = self.visible();
+        let first = (vis.t.max(0.0) as i32 / TILE).clamp(0, n as i32 - 1) as usize;
+        let last = ((vis.b.min(h as f32 - 1.0).max(0.0)) as i32 / TILE).clamp(0, n as i32 - 1) as usize;
+        for (i, t) in self.tiles.iter_mut().enumerate() {
+            if i + 2 < first || i > last + 2 {
+                *t = None;
+            }
+        }
+        let dc: Option<ID2D1DeviceContext> = rt.cast().ok();
+        for i in first..=last {
+            let y0 = i as i32 * TILE;
+            let th = TILE.min(h - y0);
+            if self.tiles[i].is_none() {
+                let need = ((y0 + th) * w * 4) as usize;
+                if self.shot.px.len() >= need {
+                    let at = (y0 * w * 4) as usize;
+                    self.tiles[i] =
+                        export::make_bitmap_pitch(rt, &self.shot.px[at..], w, th, w * 4).ok();
+                }
+            }
+            let Some(b) = &self.tiles[i] else { continue };
+            let dest = rc(RectF::new(0.0, y0 as f32, w as f32, (y0 + th) as f32));
+            unsafe {
+                match &dc {
+                    // Smaller than 1:1: a good filter keeps text readable.
+                    Some(dc) if v.k < 0.999 => dc.DrawBitmap(
+                        b,
+                        Some(&dest),
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                        None,
+                        None,
+                    ),
+                    _ => rt.DrawBitmap(
+                        b,
+                        Some(&dest),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Zoom pill and scroll bar, in window pixels (identity transform).
+    fn draw_view_chrome(&self, rt: &ID2D1RenderTarget) -> Result<()> {
+        let Some(v) = self.view else { return Ok(()) };
+        let hover = if matches!(self.drag, Drag::None) {
+            self.chrome_at(self.win_mouse)
+        } else {
+            None
+        };
+        if let Some((track, thumb)) = self.scrollbar() {
+            let on = matches!(self.vdrag, VDrag::Thumb { .. }) || hover.is_some_and(|c| c != Chrome::Zoom);
+            unsafe {
+                rt.FillRoundedRectangle(
+                    &rrect(track, track.w() * 0.5),
+                    &self.painter.brush(rt, rgba(1.0, 1.0, 1.0, if on { 0.08 } else { 0.0 }))?,
+                );
+                rt.FillRoundedRectangle(
+                    &rrect(thumb, thumb.w() * 0.5),
+                    &self.painter.brush(rt, rgba(1.0, 1.0, 1.0, if on { 0.55 } else { 0.32 }))?,
+                );
+            }
+        }
+        let r = self.zoom_rect();
+        self.pill(rt, r, if hover == Some(Chrome::Zoom) { 0.97 } else { 0.86 })?;
+        self.label(
+            rt,
+            &self.zoom_text(),
+            p(r.l + 11.0 * v.ui, r.t + 5.0 * v.ui),
+            12.0 * v.ui,
+            rgba(1.0, 1.0, 1.0, 0.92),
+            true,
+        )?;
+        Ok(())
+    }
+}
+
+/// Renders the tall-picture editor off screen into PNG files (--ui-shots):
+/// the top of the picture at 100 %, then the whole picture zoomed out.
+pub fn preview_tall(cfg: Config, shot: Shot, shapes: Vec<Shape>, dir: &std::path::Path) -> Result<()> {
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::*;
+    register_class();
+    let painter = Painter::new(&cfg.font, cfg.corner_radius)?;
+    let hwnd = unsafe {
+        let name = W::new(OVERLAY_CLASS);
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            name.p(),
+            name.p(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            GetModuleHandleW(None).unwrap_or_default(),
+            None,
+        )?
+    };
+    let (ww, wh) = (1600.0f32, 900.0f32);
+    let mut o = build(hwnd, HWND::default(), cfg, shot, painter);
+    o.view = Some(View {
+        k: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+        ww,
+        wh,
+        ui: 1.0,
+    });
+    o.clamp_view();
+    if let Some(v) = o.view.as_mut() {
+        v.ty = 16.0;
+    }
+    o.clamp_view();
+    o.phase = Phase::Editing;
+    o.sel = Some(o.shot.full());
+    o.shapes = shapes;
+    o.tool = Tool::Arrow;
+    o.win_mouse = p(ww - 8.0, 300.0);
+    o.mouse = o.to_img(o.win_mouse);
+    o.toast = Some(("Stopped at the 30 000 px limit".into(), Instant::now(), false));
+    let fit = o.fit_k();
+    for (name, k) in [("ui-5-tall.png", None), ("ui-6-tall-zoomed-out.png", Some(fit))] {
+        if let Some(k) = k {
+            o.toast = None;
+            o.zoom_at(k, p(ww * 0.5, wh * 0.5));
+        }
+        unsafe {
+            let wic: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let target = wic.CreateBitmap(
+                ww as u32,
+                wh as u32,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapCacheOnLoad,
+            )?;
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            let rt = o.painter.d2d.CreateWicBitmapRenderTarget(&target, &props)?;
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            o.tiles.clear();
+            o.fx_bmp.clear();
+            o.dashed = o.painter.dashed().ok();
+            let v = o.view.unwrap();
+            rt.BeginDraw();
+            rt.Clear(Some(&rgba(0.043, 0.047, 0.055, 1.0)));
+            rt.SetTransform(&Matrix3x2 {
+                M11: v.k,
+                M12: 0.0,
+                M21: 0.0,
+                M22: v.k,
+                M31: v.tx,
+                M32: v.ty,
+            });
+            o.draw_tiles(&rt, v);
+            let _ = o.draw_scene(&rt);
+            rt.SetTransform(&Matrix3x2::identity());
+            let _ = o.draw_view_chrome(&rt);
+            rt.EndDraw(None, None)?;
+            let mut px = vec![0u8; (ww * wh * 4.0) as usize];
+            target.CopyPixels(std::ptr::null(), ww as u32 * 4, &mut px)?;
+            o.tiles.clear();
+            o.fx_bmp.clear();
+            let img = Image {
+                w: ww as u32,
+                h: wh as u32,
+                bgra: px,
+            };
+            let data = encode::png(&img, 0).map_err(|e| windows::core::Error::new(E_FAIL, e))?;
+            let _ = std::fs::write(dir.join(name), data);
+        }
+    }
+    Ok(())
+}
+
+/// Snaps a dragged angle: 15 degree steps with Shift, otherwise it sticks to
+/// straight angles within 3 degrees.
+fn snap_angle(a: f32, shift: bool) -> f32 {
+    let a = wrap_deg(a);
+    let r = if shift {
+        (a / 15.0).round() * 15.0
+    } else {
+        let s = (a / 90.0).round() * 90.0;
+        if (a - s).abs() < 3.0 {
+            s
+        } else {
+            a
+        }
+    };
+    let r = wrap_deg(r);
+    if r.abs() < 0.01 {
+        0.0
+    } else {
+        r
+    }
+}
+
+/// `c` moved back onto a character boundary of `t`.
+fn clamp_caret(t: &str, c: usize) -> usize {
+    let mut c = c.min(t.len());
+    while !t.is_char_boundary(c) {
+        c -= 1;
+    }
+    c
+}
+
+/// Byte offset of the UTF-16 offset `k` in `t`.
+fn byte_at_u16(t: &str, k: usize) -> usize {
+    let mut n = 0;
+    for (b, ch) in t.char_indices() {
+        if n >= k {
+            return b;
+        }
+        n += ch.len_utf16();
+    }
+    t.len()
+}
+
+/// Start of the word before byte offset `c`.
+fn word_left(t: &str, c: usize) -> usize {
+    let head = t[..c].trim_end();
+    head.char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(0, |(b, ch)| b + ch.len_utf8())
+}
+
+/// End of the word after byte offset `c`.
+fn word_right(t: &str, c: usize) -> usize {
+    let tail = &t[c..];
+    let skip = tail.len() - tail.trim_start().len();
+    let rest = &tail[skip..];
+    c + skip + rest.find(char::is_whitespace).unwrap_or(rest.len())
+}
+
+/// Text editing and turning driven through the overlay's own mouse and key
+/// handlers on a hidden window (used by --selftest).
+pub fn text_edit_test() -> std::result::Result<String, String> {
+    fn check(ok: bool, what: &str) -> std::result::Result<(), String> {
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("text editing: {what}"))
+        }
+    }
+    fn text(o: &Overlay) -> String {
+        match o.shapes.first().map(|s| &s.kind) {
+            Some(Kind::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+    fn angle(o: &Overlay) -> f32 {
+        match o.shapes.first().map(|s| &s.kind) {
+            Some(Kind::Text { angle, .. }) => *angle,
+            _ => f32::NAN,
+        }
+    }
+    // What the painter does each time it draws the text.
+    fn measure(o: &Overlay) {
+        if let Some(s) = o.shapes.first() {
+            if let Kind::Text {
+                text, wrap, ext, ..
+            } = &s.kind
+            {
+                if let Ok((_, tw, th)) = o.painter.text_layout(text, &s.style, *wrap) {
+                    ext.set((tw, th));
+                }
+            }
+        }
+    }
+    register_class();
+    let cfg = Config::default();
+    let painter = Painter::new(&cfg.font, cfg.corner_radius).map_err(|e| e.to_string())?;
+    let hwnd = unsafe {
+        let name = W::new(OVERLAY_CLASS);
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            name.p(),
+            name.p(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            GetModuleHandleW(None).unwrap_or_default(),
+            None,
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let (w, h) = (900i32, 600i32);
+    let mut px = vec![0x30u8; (w * h * 4) as usize];
+    for a in px.chunks_exact_mut(4) {
+        a[3] = 255;
+    }
+    let shot = Shot {
+        ox: 0,
+        oy: 0,
+        w,
+        h,
+        px,
+        windows: Vec::new(),
+        monitors: Vec::new(),
+        foreground: None,
+    };
+    let mut o = build(hwnd, HWND::default(), cfg, shot, painter);
+    o.phase = Phase::Editing;
+    o.sel = Some(RectI::new(0, 0, w, h));
+    o.tool = Tool::Text;
+
+    // Typing, caret keys, Delete, Enter.
+    o.on_down(p(200.0, 250.0));
+    o.on_up(p(200.0, 250.0));
+    for c in "Hello world".encode_utf16() {
+        o.on_char(c);
+    }
+    check(text(&o) == "Hello world" && o.caret == 11, "typing")?;
+    o.move_caret(VK_LEFT, true);
+    o.insert_text("big ");
+    check(text(&o) == "Hello big world", "Ctrl+Left and insert")?;
+    o.move_caret(VK_HOME, false);
+    o.erase(true, false);
+    check(text(&o) == "ello big world", "Home and Delete")?;
+    o.move_caret(VK_END, false);
+    o.on_char('\r' as u16);
+    o.on_char('x' as u16);
+    check(text(&o) == "ello big world\nx", "End and Enter")?;
+    o.move_caret(VK_UP, false);
+    check(o.caret < 4, "Up to the first line")?;
+    o.move_caret(VK_RIGHT, true);
+    o.erase(false, true);
+    check(text(&o) == " big world\nx" && o.caret == 0, "Ctrl+Right and Ctrl+Backspace")?;
+
+    // A click in the text puts the caret there.
+    measure(&o);
+    let at = match o.shapes[0].kind {
+        Kind::Text { at, .. } => at,
+        _ => P::default(),
+    };
+    o.move_caret(VK_END, true);
+    o.on_down(at.add(p(2.0, 5.0)));
+    o.on_up(at.add(p(2.0, 5.0)));
+    check(o.caret == 0 && o.editing == Some(0), "click places the caret")?;
+    o.commit_text();
+    o.tool = Tool::Select;
+    o.selected = Some(0);
+
+    // Turn by the knob (under the box): drag it to the left of the centre = 90 degrees.
+    measure(&o);
+    let undo0 = o.undo.len();
+    let (b, _) = o.shapes[0].text_box().unwrap_or_default();
+    let c = p(b.cx(), b.cy());
+    let knob = o.shapes[0].rot_handle(o.knob_off()).map(|k| k.1).unwrap_or(c);
+    o.last_click.0 = Instant::now() - Duration::from_secs(5);
+    o.on_down(knob);
+    o.on_move(c.add(p(-150.0, 0.0)));
+    o.on_up(c.add(p(-150.0, 0.0)));
+    check((angle(&o) - 90.0).abs() < 0.01, "knob turns to 90")?;
+    check(o.undo.len() == undo0 + 1, "a turn is one undo step")?;
+    let s = &o.shapes[0];
+    check(
+        s.hit(c.add(p(0.0, b.w() * 0.4)), 0.0) && !s.hit(c.add(p(b.w() * 0.4, 0.0)), 0.0),
+        "hit test follows the turned box",
+    )?;
+
+    // Font size by a corner: 1.5 times as far from the opposite corner.
+    let cs = o.shapes[0].text_corners().unwrap_or_default();
+    let w0 = o.shapes[0].style.width;
+    let to = cs[0].add(cs[2].sub(cs[0]).mul(1.5));
+    o.last_click.0 = Instant::now() - Duration::from_secs(5);
+    o.on_down(cs[2]);
+    o.on_move(to);
+    o.on_up(to);
+    let w1 = o.shapes[0].style.width;
+    let cs1 = o.shapes[0].text_corners().unwrap_or_default();
+    check((w1 - (w0 * 1.5).round()).abs() < 0.01, "corner resizes the font")?;
+    check(cs1[0].dist(cs[0]) < 1.0, "opposite corner stays put")?;
+
+    // Ctrl+D, toolbar buttons and undo / redo of all of it.
+    o.duplicate();
+    check(o.shapes.len() == 2 && o.selected == Some(1), "Ctrl+D")?;
+    o.selected = Some(0);
+    for h in [Hit::Align(Align::Center), Hit::Bold, Hit::Italic, Hit::Turn(-1)] {
+        let lay = o.layout();
+        let Some((r, _)) = lay.iter().find(|(_, x)| *x == h).copied() else {
+            return Err(format!("text editing: no {h:?} button in the toolbar"));
+        };
+        o.on_down(p(r.cx(), r.cy()));
+        o.on_up(p(r.cx(), r.cy()));
+    }
+    let st = o.shapes[0].style;
+    check(
+        st.align == Align::Center && !st.bold && st.italic,
+        "toolbar align / bold / italic",
+    )?;
+    check((angle(&o) - 75.0).abs() < 0.01, "toolbar turns by 15")?;
+
+    // A side bar sets the width the lines wrap in; the other edge stays.
+    measure(&o);
+    let cs = o.shapes[0].text_corners().unwrap_or_default();
+    let sides = o.shapes[0].text_sides().unwrap_or_default();
+    let h0 = o.shapes[0].text_box().map_or(0.0, |b| b.0.h());
+    let to = sides[1].add(cs[0].sub(cs[1]).mul(0.45));
+    o.last_click.0 = Instant::now() - Duration::from_secs(5);
+    o.on_down(sides[1]);
+    o.on_move(to);
+    o.on_up(to);
+    let wrap = match o.shapes[0].kind {
+        Kind::Text { wrap, .. } => wrap,
+        _ => 0.0,
+    };
+    let h1 = o.shapes[0].text_box().map_or(0.0, |b| b.0.h());
+    let cs1 = o.shapes[0].text_corners().unwrap_or_default();
+    check(wrap > 0.0 && h1 > h0 * 1.3, "side bar wraps the lines")?;
+    check(cs1[0].dist(cs[0]) < 1.0, "left edge stays while wrapping")?;
+
+    // The cross deletes the text.
+    o.last_click.0 = Instant::now() - Duration::from_secs(5);
+    o.on_down(cs1[0]);
+    o.on_up(cs1[0]);
+    check(o.shapes.len() == 1 && o.selected.is_none(), "cross deletes")?;
+    // Delete, wrap, turn, italic, bold, align, Ctrl+D, resize, knob turn.
+    for _ in 0..9 {
+        o.undo_step();
+    }
+    check(
+        o.shapes.len() == 1 && angle(&o) == 0.0 && o.shapes[0].style.width == w0,
+        "undo back to the straight text",
+    )?;
+    o.redo_step();
+    check((angle(&o) - 90.0).abs() < 0.01, "redo the turn")?;
+    Ok("text editing: typing, caret keys and clicks, knob turn with hit test, corner resize, side wrap, delete cross, Ctrl+D, toolbar align/bold/italic/turn, undo/redo".into())
 }

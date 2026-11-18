@@ -90,66 +90,135 @@ fn file_uri(p: &Path) -> String {
     out
 }
 
-/// Small preview for the notification (Windows limits toast images to ~1024 px / 3 MB).
-pub fn thumbnail(img: &Image) -> Option<PathBuf> {
-    let dir = data_dir().join("thumbs");
-    let _ = std::fs::create_dir_all(&dir);
-    // Keep only the latest previews.
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        let mut files: Vec<_> = rd
-            .flatten()
-            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-            .collect();
-        files.sort();
-        let n = files.len();
-        for (_, p) in files.into_iter().take(n.saturating_sub(15)) {
-            let _ = std::fs::remove_file(p);
-        }
-    }
+/// Folder of shot previews. One JPEG per shot, shared by the notification and the
+/// History window; `history` deletes the ones no entry refers to.
+pub fn thumbs_dir() -> PathBuf {
+    data_dir().join("thumbs")
+}
+
+/// Longest side of a preview: sharp in a notification at 200 % scaling, ~60 KB as JPEG.
+pub const THUMB_MAX: u32 = 640;
+
+/// Box-filter downscale (each target pixel averages the source pixels under it), so
+/// thin text and UI lines blend instead of flickering in and out.
+pub fn downscale(img: &Image, max: u32) -> Image {
     let (w, h) = (img.w as usize, img.h as usize);
-    let k = (720.0 / w as f32).min(720.0 / h as f32).min(1.0);
+    let k = (max as f32 / w as f32).min(max as f32 / h as f32).min(1.0);
     let (tw, th) = (
         ((w as f32 * k).round() as usize).max(1),
         ((h as f32 * k).round() as usize).max(1),
     );
-    // Box filter: average all source pixels that fall into each target pixel.
     let mut out = vec![0u8; tw * th * 4];
+    let mut acc = vec![0u32; tw * 3];
+    let xs: Vec<(usize, usize)> = (0..tw)
+        .map(|tx| {
+            let x0 = tx * w / tw;
+            (x0, ((tx + 1) * w / tw).max(x0 + 1).min(w))
+        })
+        .collect();
     for ty in 0..th {
         let y0 = ty * h / th;
         let y1 = ((ty + 1) * h / th).max(y0 + 1).min(h);
-        for tx in 0..tw {
-            let x0 = tx * w / tw;
-            let x1 = ((tx + 1) * w / tw).max(x0 + 1).min(w);
-            let mut s = [0u32; 3];
-            for y in y0..y1 {
-                let row = y * w * 4;
-                for x in x0..x1 {
-                    let i = row + x * 4;
-                    s[0] += img.bgra[i] as u32;
-                    s[1] += img.bgra[i + 1] as u32;
-                    s[2] += img.bgra[i + 2] as u32;
+        acc.iter_mut().for_each(|a| *a = 0);
+        for y in y0..y1 {
+            let row = &img.bgra[y * w * 4..(y + 1) * w * 4];
+            for (tx, &(x0, x1)) in xs.iter().enumerate() {
+                let a = &mut acc[tx * 3..tx * 3 + 3];
+                for px in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                    a[0] += px[0] as u32;
+                    a[1] += px[1] as u32;
+                    a[2] += px[2] as u32;
                 }
             }
+        }
+        for (tx, &(x0, x1)) in xs.iter().enumerate() {
             let n = ((y1 - y0) * (x1 - x0)) as u32;
             let o = (ty * tw + tx) * 4;
-            out[o] = (s[0] / n) as u8;
-            out[o + 1] = (s[1] / n) as u8;
-            out[o + 2] = (s[2] / n) as u8;
+            out[o] = (acc[tx * 3] / n) as u8;
+            out[o + 1] = (acc[tx * 3 + 1] / n) as u8;
+            out[o + 2] = (acc[tx * 3 + 2] / n) as u8;
             out[o + 3] = 255;
         }
     }
-    let thumb = Image {
+    Image {
         w: tw as u32,
         h: th as u32,
         bgra: out,
-    };
-    let data = encode::png(&thumb, 0).ok()?;
+    }
+}
+
+/// Writes `img` as a JPEG with Windows' own encoder (WIC).
+pub fn write_jpeg(img: &Image, path: &Path, quality: f32) -> bool {
+    use windows::core::{PWSTR, VARIANT};
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::StructuredStorage::*;
+    use windows::Win32::System::Com::*;
+    let r = (|| -> windows::core::Result<()> {
+        unsafe {
+            let wic: IWICImagingFactory =
+                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let stream = wic.CreateStream()?;
+            let p = crate::win::W::new(&path.display().to_string());
+            stream.InitializeFromFilename(p.p(), GENERIC_WRITE.0)?;
+            let enc = wic.CreateEncoder(&GUID_ContainerFormatJpeg, std::ptr::null())?;
+            enc.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            let mut frame: Option<IWICBitmapFrameEncode> = None;
+            let mut bag: Option<IPropertyBag2> = None;
+            enc.CreateNewFrame(&mut frame, &mut bag)?;
+            let frame = frame.ok_or_else(windows::core::Error::empty)?;
+            if let Some(bag) = &bag {
+                let mut name = crate::win::wide("ImageQuality");
+                let prop = PROPBAG2 {
+                    pstrName: PWSTR(name.as_mut_ptr()),
+                    ..Default::default()
+                };
+                let _ = bag.Write(1, &prop, &VARIANT::from(quality));
+            }
+            frame.Initialize(bag.as_ref())?;
+            frame.SetSize(img.w, img.h)?;
+            // The JPEG encoder takes 24-bit BGR (it would silently switch a 32-bit format).
+            let mut fmt = GUID_WICPixelFormat24bppBGR;
+            frame.SetPixelFormat(&mut fmt)?;
+            if fmt != GUID_WICPixelFormat24bppBGR {
+                return Err(windows::core::Error::empty());
+            }
+            let bgr: Vec<u8> = img
+                .bgra
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            frame.WritePixels(img.h, img.w * 3, &bgr)?;
+            frame.Commit()?;
+            enc.Commit()?;
+            stream.Commit(STGC_DEFAULT)
+        }
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    r.is_ok()
+}
+
+/// Preview of a shot for the notification and the History window (Windows limits
+/// toast images to ~1024 px / 3 MB and takes PNG or JPEG).
+pub fn thumbnail(img: &Image) -> Option<PathBuf> {
+    let dir = thumbs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let thumb = downscale(img, THUMB_MAX);
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = dir.join(format!("{t}.png"));
-    std::fs::write(&path, data).ok()?;
+    let path = (0..100)
+        .map(|i| dir.join(format!("{}.jpg", t + i)))
+        .find(|p| !p.exists())?;
+    if write_jpeg(&thumb, &path, 0.9) {
+        return Some(path);
+    }
+    // No JPEG encoder: fall back to PNG.
+    let path = path.with_extension("png");
+    std::fs::write(&path, encode::png(&thumb, 0).ok()?).ok()?;
     Some(path)
 }
 
@@ -169,6 +238,14 @@ pub struct Toast<'a> {
 
 /// Shows a Windows notification. Returns false if notifications are unavailable.
 pub fn show(t: &Toast) -> bool {
+    show_tagged(t, None)
+}
+
+const GROUP: &str = "refract";
+
+/// Like `show`; a notification with the same tag replaces the earlier one
+/// (an upload progress bar turns into "Link copied").
+pub fn show_tagged(t: &Toast, tag: Option<&str>) -> bool {
     let launch = match (t.launch_uri, t.open) {
         (Some(u), _) => format!(" activationType=\"protocol\" launch=\"{}\"", xml(u)),
         (None, Some(p)) => format!(
@@ -213,6 +290,10 @@ pub fn show(t: &Toast) -> bool {
         let x = XmlDocument::new()?;
         x.LoadXml(&HSTRING::from(doc))?;
         let toast = ToastNotification::CreateToastNotification(&x)?;
+        if let Some(tag) = tag {
+            toast.SetTag(&HSTRING::from(tag))?;
+            toast.SetGroup(&HSTRING::from(GROUP))?;
+        }
         let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?;
         notifier.Show(&toast)
     })();
@@ -220,4 +301,76 @@ pub fn show(t: &Toast) -> bool {
         crate::win::log(&format!("toast failed: {e}"));
     }
     r.is_ok()
+}
+
+/// A notification with a live progress bar (uploads that take more than a moment).
+pub struct Progress {
+    notifier: windows::UI::Notifications::ToastNotifier,
+    tag: HSTRING,
+    seq: u32,
+}
+
+impl Progress {
+    pub fn show(tag: &str, title: &str) -> Option<Progress> {
+        use windows::UI::Notifications::NotificationData;
+        let doc = format!(
+            "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><progress value=\"{{v}}\" valueStringOverride=\"{{s}}\" status=\"{{t}}\" /></binding></visual><audio silent=\"true\" /></toast>",
+            xml(title)
+        );
+        let r = (|| -> windows::core::Result<Progress> {
+            let x = XmlDocument::new()?;
+            x.LoadXml(&HSTRING::from(doc))?;
+            let toast = ToastNotification::CreateToastNotification(&x)?;
+            let tag = HSTRING::from(tag);
+            toast.SetTag(&tag)?;
+            toast.SetGroup(&HSTRING::from(GROUP))?;
+            let data = NotificationData::new()?;
+            let v = data.Values()?;
+            v.Insert(&HSTRING::from("v"), &HSTRING::from("0"))?;
+            v.Insert(&HSTRING::from("s"), &HSTRING::from(""))?;
+            v.Insert(&HSTRING::from("t"), &HSTRING::from(""))?;
+            data.SetSequenceNumber(1)?;
+            toast.SetData(&data)?;
+            let notifier =
+                ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?;
+            notifier.Show(&toast)?;
+            Ok(Progress {
+                notifier,
+                tag,
+                seq: 1,
+            })
+        })();
+        r.ok()
+    }
+
+    /// `value` 0..1; `right` is shown under the bar on the right, `left` on the left.
+    pub fn set(&mut self, value: f32, left: &str, right: &str) {
+        use windows::UI::Notifications::NotificationData;
+        self.seq += 1;
+        let _ = (|| -> windows::core::Result<()> {
+            let data = NotificationData::new()?;
+            let v = data.Values()?;
+            v.Insert(
+                &HSTRING::from("v"),
+                &HSTRING::from(format!("{:.3}", value.clamp(0.0, 1.0))),
+            )?;
+            v.Insert(&HSTRING::from("s"), &HSTRING::from(right))?;
+            v.Insert(&HSTRING::from("t"), &HSTRING::from(left))?;
+            data.SetSequenceNumber(self.seq)?;
+            self.notifier
+                .UpdateWithTagAndGroup(&data, &self.tag, &HSTRING::from(GROUP))?;
+            Ok(())
+        })();
+    }
+}
+
+/// Removes a notification shown with `show_tagged` / `Progress`.
+pub fn remove(tag: &str) {
+    let _ = (|| -> windows::core::Result<()> {
+        ToastNotificationManager::History()?.RemoveGroupedTagWithId(
+            &HSTRING::from(tag),
+            &HSTRING::from(GROUP),
+            &HSTRING::from(AUMID),
+        )
+    })();
 }

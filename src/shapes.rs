@@ -12,11 +12,15 @@ pub enum Kind {
     Arrow(P, P),
     Rect(P, P),
     Ellipse(P, P),
-    /// `ext` = measured layout size, filled in by the painter.
+    /// `ext` = measured layout size, filled in by the painter. `angle` turns the
+    /// box about its centre, in degrees clockwise. `wrap` > 0 is a fixed width
+    /// the lines wrap in; 0 = as wide as the longest line.
     Text {
         at: P,
         text: String,
         ext: Cell<(f32, f32)>,
+        angle: f32,
+        wrap: f32,
     },
     Counter {
         at: P,
@@ -24,6 +28,29 @@ pub enum Kind {
     },
     Blur(P, P),
     Pixelate(P, P),
+}
+
+pub use crate::config::Align;
+
+/// Turns `v` by `deg` degrees clockwise (y points down).
+pub fn rot(v: P, deg: f32) -> P {
+    let (s, c) = deg.to_radians().sin_cos();
+    p(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+/// Angle of `v` in degrees, clockwise from +x.
+pub fn angle_of(v: P) -> f32 {
+    v.y.atan2(v.x).to_degrees()
+}
+
+/// Wraps an angle into (-180, 180].
+pub fn wrap_deg(a: f32) -> f32 {
+    let a = a.rem_euclid(360.0);
+    if a > 180.0 {
+        a - 360.0
+    } else {
+        a
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +84,86 @@ impl Shape {
         (self.style.width * 0.32).max(4.0)
     }
 
+    /// Unturned text box (glyphs plus padding) and its angle. The painter draws
+    /// exactly this box, turned about its centre.
+    pub fn text_box(&self) -> Option<(RectF, f32)> {
+        let Kind::Text { at, ext, angle, .. } = &self.kind else {
+            return None;
+        };
+        let w = self.style.width;
+        let (tw, th) = ext.get();
+        let pad = self.text_pad();
+        let b = RectF::xywh(
+            at.x - pad,
+            at.y - pad,
+            tw.max(w * 0.3) + pad * 2.0,
+            th.max(w * 1.25) + pad * 2.0,
+        );
+        Some((b, *angle))
+    }
+
+    /// Corners of the turned text box: top-left, top-right, bottom-right, bottom-left.
+    pub fn text_corners(&self) -> Option<[P; 4]> {
+        let (b, a) = self.text_box()?;
+        let c = p(b.cx(), b.cy());
+        Some([p(b.l, b.t), p(b.r, b.t), p(b.r, b.b), p(b.l, b.b)].map(|q| c.add(rot(q.sub(c), a))))
+    }
+
+    /// Image point in the text's own (unturned) frame.
+    pub fn text_local(&self, q: P) -> P {
+        match self.text_box() {
+            Some((b, a)) => {
+                let c = p(b.cx(), b.cy());
+                c.add(rot(q.sub(c), -a))
+            }
+            None => q,
+        }
+    }
+
+    /// Rotation handle of a text: the middle of the bottom edge and the knob
+    /// `off` pixels below it.
+    pub fn rot_handle(&self, off: f32) -> Option<(P, P)> {
+        let (b, a) = self.text_box()?;
+        let c = p(b.cx(), b.cy());
+        let base = c.add(rot(p(0.0, b.b - c.y), a));
+        let knob = c.add(rot(p(0.0, b.b - c.y + off), a));
+        Some((base, knob))
+    }
+
+    /// Middles of the left and right edges of the turned text box.
+    pub fn text_sides(&self) -> Option<[P; 2]> {
+        let c = self.text_corners()?;
+        Some([c[0].lerp(c[3], 0.5), c[1].lerp(c[2], 0.5)])
+    }
+
+    /// Scales the font of a text from `orig` by dragging `corner` to `q`; the
+    /// opposite corner stays where it is.
+    pub fn scale_text(&mut self, orig: &Shape, corner: usize, q: P, range: (f32, f32)) {
+        let Some(c0) = orig.text_corners() else {
+            return;
+        };
+        let anchor = c0[(corner + 2) % 4];
+        let diag = c0[corner].sub(anchor);
+        let d0 = diag.len().max(1.0);
+        let u = diag.norm();
+        let along = (q.x - anchor.x) * u.x + (q.y - anchor.y) * u.y;
+        let k = (along / d0).max(0.02);
+        let w0 = orig.style.width;
+        let w = (w0 * k).clamp(range.0, range.1).round();
+        let k = w / w0;
+        *self = orig.clone();
+        self.style.width = w;
+        let Kind::Text { ext, .. } = &self.kind else {
+            return;
+        };
+        let (tw, th) = ext.get();
+        ext.set((tw * k, th * k));
+        // Where the anchor corner is now, then move the box back onto it.
+        let Some(c1) = self.text_corners() else { return };
+        let d = anchor.sub(c1[(corner + 2) % 4]);
+        self.translate(d);
+    }
+
     pub fn bounds(&self) -> RectF {
         let w = self.style.width;
         match &self.kind {
@@ -73,15 +180,13 @@ impl Shape {
                 RectF::from_pts(*a, *b).inflate(w * 0.5 + 1.0)
             }
             Kind::Blur(a, b) | Kind::Pixelate(a, b) => RectF::from_pts(*a, *b),
-            Kind::Text { at, ext, .. } => {
-                let (tw, th) = ext.get();
-                let pad = self.text_pad();
-                RectF::xywh(
-                    at.x - pad,
-                    at.y - pad,
-                    tw.max(w * 0.4) + pad * 2.0,
-                    th.max(w * 1.2) + pad * 2.0,
-                )
+            Kind::Text { .. } => {
+                let c = self.text_corners().unwrap_or_default();
+                let mut r = RectF::from_pts(c[0], c[0]);
+                for q in &c[1..] {
+                    r = r.union(&RectF::from_pts(*q, *q));
+                }
+                r
             }
             Kind::Counter { at, .. } => {
                 let r = self.counter_radius();
@@ -124,7 +229,10 @@ impl Shape {
                     edge <= near
                 }
             }
-            Kind::Blur(..) | Kind::Pixelate(..) | Kind::Text { .. } | Kind::Counter { .. } => {
+            Kind::Text { .. } => self
+                .text_box()
+                .is_some_and(|(b, _)| b.inflate(tol).contains(self.text_local(q))),
+            Kind::Blur(..) | Kind::Pixelate(..) | Kind::Counter { .. } => {
                 self.bounds().inflate(tol).contains(q)
             }
         }

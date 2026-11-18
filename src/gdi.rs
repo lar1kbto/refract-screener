@@ -54,6 +54,15 @@ thread_local! {
     static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// Bumped whenever the render target is (re)created: bitmaps made on the old one are gone.
+    static GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub fn generation() -> u32 {
+    GEN.with(|g| g.get())
+}
+
 fn ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> Option<R> {
     CTX.with(|c| c.borrow_mut().as_mut().map(f))
 }
@@ -82,6 +91,7 @@ fn init() -> windows::core::Result<()> {
         let rt = d2d.CreateDCRenderTarget(&props)?;
         rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+        GEN.with(|g| g.set(g.get() + 1));
         CTX.with(|c| {
             *c.borrow_mut() = Some(Ctx {
                 dw,
@@ -262,6 +272,71 @@ pub unsafe fn text(
     });
 }
 
+/// Plus sign centred in `r`, `size` px across, lines snapped to whole pixels.
+pub unsafe fn plus(_dc: HDC, r: RECT, size: f32, c: COLORREF) {
+    let t = (size / 7.0).round().max(1.0);
+    let half = (size / 2.0).round();
+    // Odd line widths sit on pixel centres, even ones on pixel edges.
+    let snap = |v: i32| v as f32 + if t as i32 % 2 == 1 { 0.5 } else { 0.0 };
+    let (cx, cy) = (snap((r.left + r.right) / 2), snap((r.top + r.bottom) / 2));
+    ctx(|x| {
+        if let Some(b) = brush(&x.rt, c) {
+            let p = |x, y| D2D_POINT_2F { x, y };
+            x.rt.DrawLine(p(cx - half, cy), p(cx + half, cy), &b, t, None);
+            x.rt.DrawLine(p(cx, cy - half), p(cx, cy + half), &b, t, None);
+        }
+    });
+}
+
+/// Cross (x) centred in `r`, `size` px across, with round ends.
+pub unsafe fn cross(_dc: HDC, r: RECT, size: f32, width: f32, c: COLORREF) {
+    let cx = (r.left + r.right) as f32 / 2.0;
+    let cy = (r.top + r.bottom) as f32 / 2.0;
+    let h = size / 2.0;
+    ctx(|x| {
+        let Some(b) = brush(&x.rt, c) else { return };
+        let Ok(f) = x.rt.GetFactory() else { return };
+        let props = D2D1_STROKE_STYLE_PROPERTIES {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            ..Default::default()
+        };
+        let style = f.CreateStrokeStyle(&props, None).ok();
+        let p = |x, y| D2D_POINT_2F { x, y };
+        x.rt.DrawLine(p(cx - h, cy - h), p(cx + h, cy + h), &b, width, style.as_ref());
+        x.rt.DrawLine(p(cx - h, cy + h), p(cx + h, cy - h), &b, width, style.as_ref());
+    });
+}
+
+/// Width of `s` in pixels when drawn by `text` with this size and weight.
+pub fn text_width(s: &str, size: f32, weight: i32) -> f32 {
+    let guess = s.chars().count() as f32 * size * 0.55;
+    if s.is_empty() || init().is_err() {
+        return if s.is_empty() { 0.0 } else { guess };
+    }
+    ctx(|x| unsafe {
+        let f = x
+            .dw
+            .CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT(weight),
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size.max(1.0),
+                w!("en-us"),
+            )
+            .ok()?;
+        let wtext: Vec<u16> = s.encode_utf16().collect();
+        let l = x.dw.CreateTextLayout(&wtext, &f, 100_000.0, 1000.0).ok()?;
+        let mut m = DWRITE_TEXT_METRICS::default();
+        l.GetMetrics(&mut m).ok()?;
+        Some(m.widthIncludingTrailingWhitespace)
+    })
+    .flatten()
+    .unwrap_or(guess)
+}
+
 /// Scales the Refract logo PNG to `size` with a high-quality filter.
 fn logo_pixels(size: i32) -> Option<Vec<u8>> {
     unsafe {
@@ -436,10 +511,133 @@ pub unsafe fn paint(hwnd: HWND, draw: impl FnOnce(HDC, RECT)) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+/// Draws into memory instead of a window: `w` x `h` BGRA pixels (README and
+/// self-test pictures of the windows).
+pub fn paint_offscreen(w: i32, h: i32, draw: impl FnOnce(HDC, RECT)) -> Option<Vec<u8>> {
+    unsafe {
+        init().ok()?;
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        ReleaseDC(None, screen);
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let old = SelectObject(mem, dib);
+        let rc = rect(0, 0, w, h);
+        let mut ok = false;
+        if let Some(rt) = ctx(|c| c.rt.clone()) {
+            if rt.BindDC(mem, &rc).is_ok() {
+                rt.BeginDraw();
+                draw(mem, rc);
+                ok = rt.EndDraw(None, None).is_ok();
+            }
+        }
+        let _ = GdiFlush();
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        if ok && !bits.is_null() {
+            std::ptr::copy_nonoverlapping(bits as *const u8, out.as_mut_ptr(), out.len());
+        }
+        // The target stays bound to the memory DC: drop it with the DC.
+        CTX.with(|c| *c.borrow_mut() = None);
+        SelectObject(mem, old);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem);
+        for a in out.iter_mut().skip(3).step_by(4) {
+            *a = 255;
+        }
+        ok.then_some(out)
+    }
+}
+
 pub fn set_cursor(hand: bool) {
     unsafe {
         if let Ok(c) = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }) {
             SetCursor(c);
         }
     }
+}
+
+/// Direct access to the target during `paint` (custom shapes, clips).
+pub unsafe fn with_rt<R>(f: impl FnOnce(&ID2D1RenderTarget) -> R) -> Option<R> {
+    ctx(|c| f(&c.rt))
+}
+
+/// Solid brush on the current target, `a` = opacity.
+pub unsafe fn brush_a(c: COLORREF, a: f32) -> Option<ID2D1SolidColorBrush> {
+    ctx(|x| x.rt.CreateSolidColorBrush(&D2D1_COLOR_F { a, ..col(c) }, None).ok()).flatten()
+}
+
+/// Opaque BGRA pixels as a bitmap of the current target (valid while `generation()` stays).
+pub fn bitmap(px: &[u8], w: u32, h: u32) -> Option<ID2D1Bitmap> {
+    if init().is_err() || px.len() < (w * h * 4) as usize {
+        return None;
+    }
+    ctx(|c| unsafe {
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        c.rt.CreateBitmap(
+            D2D_SIZE_U {
+                width: w,
+                height: h,
+            },
+            Some(px.as_ptr() as *const _),
+            w * 4,
+            &props,
+        )
+        .ok()
+    })
+    .flatten()
+}
+
+/// Draws `bmp` stretched to `dst` with anti-aliased rounded corners.
+pub unsafe fn image(bmp: &ID2D1Bitmap, dst: D2D_RECT_F, radius: f32) {
+    ctx(|c| {
+        let sz = bmp.GetSize();
+        if sz.width <= 0.0 || sz.height <= 0.0 {
+            return;
+        }
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES {
+            extendModeX: D2D1_EXTEND_MODE_CLAMP,
+            extendModeY: D2D1_EXTEND_MODE_CLAMP,
+            interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+        };
+        let Ok(b) = c.rt.CreateBitmapBrush(bmp, Some(&props), None) else {
+            return;
+        };
+        let (sx, sy) = (
+            (dst.right - dst.left) / sz.width,
+            (dst.bottom - dst.top) / sz.height,
+        );
+        b.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+            M11: sx,
+            M12: 0.0,
+            M21: 0.0,
+            M22: sy,
+            M31: dst.left,
+            M32: dst.top,
+        });
+        c.rt.FillRoundedRectangle(
+            &D2D1_ROUNDED_RECT {
+                rect: dst,
+                radiusX: radius,
+                radiusY: radius,
+            },
+            &b,
+        );
+    });
 }

@@ -8,7 +8,6 @@
 
 use crate::hotkey;
 use crate::win::*;
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -17,6 +16,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub const GUARD_CLASS: &str = "RefractScreenerGuard";
 /// Main app -> guard: settings changed, reload hotkeys (or quit if replacing is off).
 pub const WM_APP_GUARD_RELOAD: u32 = WM_APP + 60;
+/// Main app -> guard: wparam 1 = let every key through (a shortcut is being
+/// recorded in Settings), 0 = back to work. The pause ends by itself after a while.
+pub const WM_APP_GUARD_PAUSE: u32 = WM_APP + 61;
+const TIMER_KILL: usize = 1;
+const TIMER_UNPAUSE: usize = 2;
 
 fn load_combos() -> Option<Vec<(hotkey::Combo, hotkey::Action)>> {
     let cfg = crate::config::load().cfg;
@@ -59,7 +63,7 @@ pub fn run() {
         hotkey::set_combos(combos);
         hotkey::start(hwnd);
         kill_snipping();
-        SetTimer(hwnd, 1, 1500, None);
+        SetTimer(hwnd, TIMER_KILL, 1500, None);
         log("guard started");
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -82,6 +86,7 @@ fn forward(action: hotkey::Action) {
                 hotkey::Action::Region => "--capture",
                 hotkey::Action::Fullscreen => "--fullscreen",
                 hotkey::Action::Window => "--window",
+                hotkey::Action::Scroll => "--scroll",
             };
             log(&format!(
                 "guard: app not running, starting it for {action:?}"
@@ -99,8 +104,22 @@ unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             }
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TIMER_UNPAUSE => {
+            let _ = KillTimer(h, TIMER_UNPAUSE);
+            hotkey::set_paused(false);
+            LRESULT(0)
+        }
         WM_TIMER => {
             kill_snipping();
+            LRESULT(0)
+        }
+        WM_APP_GUARD_PAUSE => {
+            hotkey::set_paused(wp.0 != 0);
+            if wp.0 != 0 {
+                SetTimer(h, TIMER_UNPAUSE, 60_000, None);
+            } else {
+                let _ = KillTimer(h, TIMER_UNPAUSE);
+            }
             LRESULT(0)
         }
         WM_APP_GUARD_RELOAD => {
@@ -145,7 +164,15 @@ pub fn reload() {
             let _ = PostMessageW(h, WM_APP_GUARD_RELOAD, WPARAM(0), LPARAM(0));
         }
     }
-    let _ = PCWSTR::null();
+}
+
+/// Pauses a running guard while Settings records a shortcut (see WM_APP_GUARD_PAUSE).
+pub fn pause(on: bool) {
+    if let Some(h) = find_window(GUARD_CLASS) {
+        unsafe {
+            let _ = PostMessageW(h, WM_APP_GUARD_PAUSE, WPARAM(on as usize), LPARAM(0));
+        }
+    }
 }
 
 /// Windows' own screenshot tools: Snipping Tool (Windows 11 app and the classic

@@ -1,8 +1,10 @@
 //! The settings window: screenshot folder (change / open / reset), format, what
 //! happens after a capture, capture options, start with Windows, Snipping Tool
-//! replacement and updates. Changes apply immediately and are saved to config.json.
+//! replacement, updates and hotkeys. Changes apply immediately and are saved to
+//! config.json.
 
 use crate::gdi::*;
+use crate::hotkey::{self, Action, Combo};
 use crate::menu_id::*;
 use std::cell::RefCell;
 use windows::core::w;
@@ -26,7 +28,32 @@ enum Kind {
     Toggle(usize, bool),
     Button(usize, &'static str, bool, bool), // id, label, primary, enabled
     Seg(usize, usize, bool),                 // png id, webp id, png selected
+    Chip(Action, usize, Chip),               // shortcut of an action
+    Remove(Action, usize),                   // the x on a chip
+    Add(Action),                             // "+": record one more shortcut
+    ResetKeys(bool),                         // enabled
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Chip {
+    Normal,
+    /// The same shortcut is set more than once: only the first one works.
+    Conflict,
+    /// PrintScreen / Win+Shift+S while "Replace Snipping Tool" is off.
+    Windows,
+}
+
+/// A shortcut being recorded: which action, which chip (None = a new one).
+#[derive(Clone)]
+struct Rec {
+    action: Action,
+    index: Option<usize>,
+    /// Modifiers held right now, shown live in the chip.
+    mods: Combo,
+    since: std::time::Instant,
+}
+
+const TIMER_REC: usize = 1;
 
 #[derive(Clone)]
 struct Item {
@@ -39,6 +66,9 @@ struct State {
     hwnd: Option<HWND>,
     hover: Option<(usize, i32)>, // item index, segment (0/1) for Seg
     k: f32,
+    rec: Option<Rec>,
+    /// Message under the hotkeys (true = error).
+    note: Option<(String, bool)>,
 }
 
 thread_local! {
@@ -49,7 +79,7 @@ fn st<R>(f: impl FnOnce(&mut State) -> R) -> R {
     S.with(|s| f(&mut s.borrow_mut()))
 }
 
-const W: f32 = 760.0;
+const W: f32 = 1040.0;
 const H: f32 = 512.0;
 const ROW: f32 = 40.0;
 
@@ -90,7 +120,7 @@ fn layout(snap: &Snapshot) -> (Vec<Item>, Vec<Text>, Vec<(f32, f32, f32)>) {
     };
 
     // Left column: folder + saving.
-    let (lx, lw) = (28.0, 344.0);
+    let (lx, lw) = (28.0, LW);
     head(&mut texts, lx, 104.0, "SCREENSHOT FOLDER");
     push(
         &mut items,
@@ -145,8 +175,8 @@ fn layout(snap: &Snapshot) -> (Vec<Item>, Vec<Text>, Vec<(f32, f32, f32)>) {
         }
     }
 
-    // Right column: capture + system.
-    let (rx, rw) = (404.0, 328.0);
+    // Middle column: capture + system.
+    let (rx, rw) = (MX, 300.0);
     head(&mut texts, rx, 104.0, "CAPTURE");
     let rows_c = [
         ("Include mouse cursor", CURSOR, c.capture_cursor),
@@ -199,7 +229,7 @@ fn layout(snap: &Snapshot) -> (Vec<Item>, Vec<Text>, Vec<(f32, f32, f32)>) {
     match &snap.update_ready {
         Some(_) => push(
             &mut items,
-            r(rx, 452.0, 196.0, 34.0),
+            r(rx, 452.0, 168.0, 34.0),
             Kind::Button(APPLY_UPDATE, "Restart to update", true, true),
         ),
         None => push(
@@ -210,10 +240,295 @@ fn layout(snap: &Snapshot) -> (Vec<Item>, Vec<Text>, Vec<(f32, f32, f32)>) {
     }
     push(
         &mut items,
-        r(rx + 208.0, 452.0, 120.0, 34.0),
+        r(rx + rw - 120.0, 452.0, 120.0, 34.0),
         Kind::Button(EDIT_CFG, "config.json", false, true),
     );
+    // Header, top right.
+    push(
+        &mut items,
+        r(W - 28.0 - 112.0, 30.0, 112.0, 34.0),
+        Kind::Button(HISTORY, "History", false, true),
+    );
+    hotkeys_layout(snap, &mut items, &mut texts);
     (items, texts, lines)
+}
+
+const LW: f32 = 316.0;
+const MX: f32 = 372.0;
+/// Hotkeys column.
+const HX: f32 = 700.0;
+const HW: f32 = 312.0;
+const CHIP_H: f32 = 28.0;
+const CHIP_FONT: f32 = 12.5;
+/// Room for the x at the right end of a chip.
+const CHIP_X: f32 = 22.0;
+const MAX_KEYS: usize = 3;
+/// Recording gives up after this long without a shortcut.
+const REC_TIMEOUT_S: u64 = 30;
+
+fn short_desc(a: Action) -> &'static str {
+    match a {
+        Action::Region => "select an area",
+        Action::Fullscreen => "monitor under the cursor",
+        Action::Window => "active window",
+        Action::Scroll => "long page",
+    }
+}
+
+/// Every shortcut with the action that uses it, in the order the hook tries
+/// them (the first one wins).
+fn uses(c: &crate::config::Config) -> Vec<(Combo, Action, usize)> {
+    let mut out = Vec::new();
+    for a in Action::ALL {
+        for (i, k) in a.keys(c).iter().enumerate() {
+            if let Some(k) = hotkey::parse(k) {
+                out.push((k, a, i));
+            }
+        }
+    }
+    out
+}
+
+fn chip_state(c: &crate::config::Config, combo: Combo) -> Chip {
+    if !c.replace_snipping_tool && hotkey::is_snipping_combo(&combo) {
+        Chip::Windows
+    } else if uses(c).iter().filter(|(k, ..)| *k == combo).count() > 1 {
+        Chip::Conflict
+    } else {
+        Chip::Normal
+    }
+}
+
+fn rec_label(r: &Rec) -> String {
+    if r.mods.has_mods() {
+        // label() of a combo without a key ends with "+".
+        format!("{}...", r.mods.label())
+    } else {
+        "Press a shortcut".into()
+    }
+}
+
+fn hotkeys_layout(snap: &Snapshot, items: &mut Vec<Item>, texts: &mut Vec<Text>) {
+    let c = &snap.cfg;
+    let rec = st(|s| s.rec.clone());
+    let rect = |l: f32, t: f32, w: f32, h: f32| RECT {
+        left: l as i32,
+        top: t as i32,
+        right: (l + w) as i32,
+        bottom: (t + h) as i32,
+    };
+    texts.push(Text {
+        at: (HX, 104.0),
+        s: "HOTKEYS".into(),
+        size: 11.5,
+        weight: 600,
+        color: FAINT,
+    });
+    let mut y = 126.0;
+    for a in Action::ALL {
+        texts.push(Text {
+            at: (HX, y),
+            s: a.name().into(),
+            size: 14.0,
+            weight: 400,
+            color: INK,
+        });
+        let nw = text_width(a.name(), 14.0, 400);
+        texts.push(Text {
+            at: (HX + nw + 8.0, y + 2.5),
+            s: short_desc(a).into(),
+            size: 11.5,
+            weight: 400,
+            color: FAINT,
+        });
+        let (mut cx, mut cy) = (HX, y + 24.0);
+        let place = |w: f32, cx: &mut f32, cy: &mut f32| {
+            if *cx > HX && *cx + w > HX + HW {
+                *cx = HX;
+                *cy += CHIP_H + 6.0;
+            }
+            let at = (*cx, *cy);
+            *cx += w + 6.0;
+            at
+        };
+        let keys = a.keys(c);
+        for (i, k) in keys.iter().enumerate() {
+            let recording = rec
+                .as_ref()
+                .filter(|r| r.action == a && r.index == Some(i));
+            let (label, state) = match (recording, hotkey::parse(k)) {
+                (Some(r), _) => (rec_label(r), Chip::Normal),
+                (None, Some(combo)) => (combo.label(), chip_state(c, combo)),
+                (None, None) => (format!("{k}?"), Chip::Conflict),
+            };
+            let w = text_width(&label, CHIP_FONT, 500).ceil() + 18.0 + CHIP_X;
+            let (x, yy) = place(w, &mut cx, &mut cy);
+            if recording.is_none() {
+                items.push(Item {
+                    r: rect(x + w - CHIP_X - 2.0, yy, CHIP_X + 2.0, CHIP_H),
+                    kind: Kind::Remove(a, i),
+                });
+            }
+            items.push(Item {
+                r: rect(x, yy, w, CHIP_H),
+                kind: Kind::Chip(a, i, state),
+            });
+        }
+        let adding = rec
+            .as_ref()
+            .filter(|r| r.action == a && r.index.is_none());
+        let add_w = match adding {
+            Some(r) => Some(text_width(&rec_label(r), CHIP_FONT, 500) + 24.0),
+            None if keys.len() < MAX_KEYS && keys.is_empty() => {
+                Some(text_width("Add shortcut", CHIP_FONT, 500).ceil() + CHIP_H + 14.0)
+            }
+            None if keys.len() < MAX_KEYS => Some(CHIP_H),
+            None => None,
+        };
+        if let Some(w) = add_w {
+            let (x, yy) = place(w, &mut cx, &mut cy);
+            items.push(Item {
+                r: rect(x, yy, w, CHIP_H),
+                kind: Kind::Add(a),
+            });
+        }
+        y = cy + CHIP_H + 12.0;
+    }
+    let defaults = crate::config::Config::default();
+    let changed = Action::ALL
+        .iter()
+        .any(|a| a.keys(c) != a.keys(&defaults));
+    items.push(Item {
+        r: rect(HX, 452.0, 150.0, 34.0),
+        kind: Kind::ResetKeys(changed),
+    });
+}
+
+/// The line under the hotkeys: what to do while recording, else what is wrong.
+fn hotkeys_note(snap: &Snapshot) -> Option<(String, bool)> {
+    let c = &snap.cfg;
+    if let Some(n) = st(|s| s.note.clone()) {
+        return Some(n);
+    }
+    if st(|s| s.rec.is_some()) {
+        return Some(("Press the new shortcut. Esc cancels.".into(), false));
+    }
+    let all = uses(c);
+    for (i, (k, a, _)) in all.iter().enumerate() {
+        if !c.replace_snipping_tool && hotkey::is_snipping_combo(k) {
+            continue;
+        }
+        if let Some((_, b, _)) = all[i + 1..].iter().find(|(x, ..)| x == k) {
+            let msg = if a == b {
+                format!("{} is set twice for {}.", k.label(), a.name())
+            } else {
+                format!(
+                    "{} is set for {} and {}: only {} gets it.",
+                    k.label(),
+                    a.name(),
+                    b.name(),
+                    a.name()
+                )
+            };
+            return Some((msg, true));
+        }
+    }
+    if !c.replace_snipping_tool && all.iter().any(|(k, ..)| hotkey::is_snipping_combo(k)) {
+        return Some((
+            "PrtSc and Win+Shift+S go to Windows while Replace Snipping Tool is off.".into(),
+            false,
+        ));
+    }
+    None
+}
+
+// ---------------------------------------------------------------- recording
+
+fn rec_begin(action: Action, index: Option<usize>) {
+    let Some(h) = st(|s| s.hwnd) else { return };
+    st(|s| {
+        s.note = None;
+        s.rec = Some(Rec {
+            action,
+            index,
+            mods: Combo::unpack(0),
+            since: std::time::Instant::now(),
+        })
+    });
+    crate::guard::pause(true);
+    hotkey::record_start(h);
+    unsafe {
+        SetTimer(h, TIMER_REC, 1000, None);
+    }
+    refresh();
+}
+
+fn rec_end() {
+    if st(|s| s.rec.take()).is_none() {
+        return;
+    }
+    hotkey::record_stop();
+    crate::guard::pause(false);
+    if let Some(h) = st(|s| s.hwnd) {
+        unsafe {
+            let _ = KillTimer(h, TIMER_REC);
+        }
+    }
+    refresh();
+}
+
+fn on_recorded(combo: Combo) {
+    let Some(rec) = st(|s| s.rec.clone()) else {
+        return;
+    };
+    if combo.vk == VK_ESCAPE.0 as u32 && !combo.has_mods() {
+        rec_end();
+        return;
+    }
+    if let Some(p) = hotkey::problem(&combo) {
+        // Keep recording: the next press may be fine.
+        st(|s| s.note = Some((p, true)));
+        refresh();
+        return;
+    }
+    let snap = crate::settings_snapshot();
+    let mut keys = rec.action.keys(&snap.cfg).clone();
+    let same = keys
+        .iter()
+        .enumerate()
+        .any(|(i, k)| hotkey::parse(k) == Some(combo) && Some(i) != rec.index);
+    rec_end();
+    if same {
+        st(|s| {
+            s.note = Some((
+                format!("{} is already set for {}.", combo.label(), rec.action.name()),
+                false,
+            ))
+        });
+        refresh();
+        return;
+    }
+    match rec.index {
+        Some(i) if i < keys.len() => keys[i] = combo.text(),
+        _ => keys.push(combo.text()),
+    }
+    crate::set_hotkeys(rec.action, keys);
+    refresh();
+}
+
+fn remove_key(action: Action, i: usize) {
+    let mut keys = action.keys(&crate::settings_snapshot().cfg).clone();
+    if i < keys.len() {
+        keys.remove(i);
+        crate::set_hotkeys(action, keys);
+    }
+}
+
+fn reset_keys() {
+    let d = crate::config::Config::default();
+    for a in Action::ALL {
+        crate::set_hotkeys(a, a.keys(&d).clone());
+    }
 }
 
 fn scaled(r: &RECT, k: f32) -> RECT {
@@ -254,16 +569,6 @@ unsafe fn draw(dc: HDC, rc: RECT) {
         DIM,
         DT_SINGLELINE | DT_LEFT | DT_TOP,
     );
-    let mut t = rect(px(404.0), px(30.0), rc.right - px(28.0), px(74.0));
-    text(
-        dc,
-        "PrintScreen  \u{00B7}  Win+Shift+S",
-        &mut t,
-        12.5 * k,
-        500,
-        FAINT,
-        DT_SINGLELINE | DT_RIGHT | DT_TOP,
-    );
     fill(
         dc,
         rect(px(28.0), px(88.0), rc.right - px(28.0), px(88.0) + 1),
@@ -297,7 +602,7 @@ unsafe fn draw(dc: HDC, rc: RECT) {
     }
 
     // Folder path box.
-    let pb = rect(px(28.0), px(126.0), px(372.0), px(166.0));
+    let pb = rect(px(28.0), px(126.0), px(28.0 + LW), px(166.0));
     frame(dc, pb, px(12.0), PANEL, EDGE);
     let mut t = rect(pb.left + px(14.0), pb.top, pb.right - px(12.0), pb.bottom);
     text(
@@ -310,10 +615,127 @@ unsafe fn draw(dc: HDC, rc: RECT) {
         DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_PATH_ELLIPSIS,
     );
 
+    let rec = st(|s| s.rec.clone());
+    let mut keys_bottom = 0;
     for (i, it) in items.iter().enumerate() {
         let r = scaled(&it.r, k);
         let hov = hover.map(|h| h.0) == Some(i);
         match &it.kind {
+            Kind::Remove(..) => {}
+            Kind::Chip(a, idx, state) => {
+                keys_bottom = keys_bottom.max(it.r.bottom);
+                let recording = rec
+                    .as_ref()
+                    .is_some_and(|x| x.action == *a && x.index == Some(*idx));
+                let x_hov = hover
+                    .and_then(|h| items.get(h.0))
+                    .is_some_and(|h| matches!(h.kind, Kind::Remove(b, j) if b == *a && j == *idx));
+                let label = match (recording, rec.as_ref()) {
+                    (true, Some(x)) => rec_label(x),
+                    _ => a
+                        .keys(&snap.cfg)
+                        .get(*idx)
+                        .map(|s| match hotkey::parse(s) {
+                            Some(c) => c.label(),
+                            None => format!("{s}?"),
+                        })
+                        .unwrap_or_default(),
+                };
+                let lit = hov || x_hov;
+                let (bg, edge, ink) = if recording {
+                    (rgb(0x12, 0x22, 0x1B), MINT, MINT)
+                } else {
+                    match state {
+                        Chip::Normal => (
+                            if lit { rgb(0x1C, 0x27, 0x22) } else { PANEL },
+                            if lit { rgb(0x3A, 0x5A, 0x4B) } else { EDGE },
+                            INK,
+                        ),
+                        Chip::Conflict => (
+                            if lit { rgb(0x2A, 0x1A, 0x1D) } else { rgb(0x1E, 0x14, 0x16) },
+                            rgb(0xC8, 0x52, 0x60),
+                            rgb(0xFF, 0x9A, 0xA4),
+                        ),
+                        Chip::Windows => (
+                            BG,
+                            if lit { EDGE } else { rgb(0x18, 0x22, 0x1E) },
+                            FAINT,
+                        ),
+                    }
+                };
+                frame(dc, r, r.bottom - r.top, bg, edge);
+                let mut t = rect(r.left + px(12.0), r.top, r.right - px(CHIP_X), r.bottom);
+                text(
+                    dc,
+                    &label,
+                    &mut t,
+                    CHIP_FONT * k,
+                    500,
+                    ink,
+                    DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS,
+                );
+                if !recording {
+                    let t = rect(r.right - px(CHIP_X), r.top, r.right - px(4.0), r.bottom);
+                    cross(dc, t, 6.5 * k, 1.4 * k, if x_hov { INK } else { FAINT });
+                }
+            }
+            Kind::Add(a) => {
+                keys_bottom = keys_bottom.max(it.r.bottom);
+                let recording = rec
+                    .as_ref()
+                    .filter(|x| x.action == *a && x.index.is_none());
+                let empty = a.keys(&snap.cfg).is_empty();
+                let (label, edge, ink) = match recording {
+                    Some(x) => (rec_label(x), MINT, MINT),
+                    None if empty => (
+                        "Add shortcut".to_string(),
+                        if hov { rgb(0x3A, 0x5A, 0x4B) } else { EDGE },
+                        if hov { INK } else { DIM },
+                    ),
+                    None => (
+                        String::new(),
+                        if hov { rgb(0x3A, 0x5A, 0x4B) } else { EDGE },
+                        if hov { INK } else { DIM },
+                    ),
+                };
+                let bg = if recording.is_some() {
+                    rgb(0x12, 0x22, 0x1B)
+                } else if hov {
+                    rgb(0x1C, 0x27, 0x22)
+                } else {
+                    BG
+                };
+                frame(dc, r, r.bottom - r.top, bg, edge);
+                if label.is_empty() {
+                    plus(dc, r, 10.0 * k, ink);
+                } else if recording.is_none() {
+                    // "+ Add shortcut": the sign in a square at the left, then the text.
+                    let h = r.bottom - r.top;
+                    plus(dc, rect(r.left + px(4.0), r.top, r.left + px(4.0) + h, r.bottom), 10.0 * k, ink);
+                    let mut t = rect(r.left + px(4.0) + h - px(4.0), r.top, r.right, r.bottom);
+                    text(dc, &label, &mut t, CHIP_FONT * k, 500, ink, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+                } else {
+                    let mut t = r;
+                    text(dc, &label, &mut t, CHIP_FONT * k, 500, ink, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+                }
+            }
+            Kind::ResetKeys(enabled) => {
+                if *enabled {
+                    button(dc, r, "Reset to defaults", false, hov, k);
+                } else {
+                    frame(dc, r, px(10.0), BG, rgb(0x18, 0x22, 0x1E));
+                    let mut t = r;
+                    text(
+                        dc,
+                        "Reset to defaults",
+                        &mut t,
+                        13.5 * k,
+                        500,
+                        FAINT,
+                        DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+                    );
+                }
+            }
             Kind::Toggle(_, on) => toggle(dc, r, *on, hov),
             Kind::Button(_, label, primary, enabled) => {
                 if *enabled {
@@ -375,6 +797,19 @@ unsafe fn draw(dc: HDC, rc: RECT) {
         FAINT,
         DT_SINGLELINE | DT_LEFT | DT_TOP,
     );
+    if let Some((msg, err)) = hotkeys_note(&snap) {
+        let y = keys_bottom as f32 + 2.0;
+        let mut t = rect(px(HX), px(y), px(HX + HW), px(446.0));
+        text(
+            dc,
+            &msg,
+            &mut t,
+            12.0 * k,
+            400,
+            if err { rgb(0xFF, 0x9A, 0xA4) } else { DIM },
+            DT_WORDBREAK | DT_LEFT | DT_TOP | DT_END_ELLIPSIS,
+        );
+    }
 }
 
 fn hit(x: i32, y: i32) -> Option<(usize, i32)> {
@@ -383,7 +818,7 @@ fn hit(x: i32, y: i32) -> Option<(usize, i32)> {
     for (i, it) in items.iter().enumerate() {
         let r = scaled(&it.r, k);
         if inside(&r, x, y) {
-            if let Kind::Button(_, _, _, false) = it.kind {
+            if let Kind::Button(_, _, _, false) | Kind::ResetKeys(false) = it.kind {
                 return None;
             }
             let seg = if let Kind::Seg(..) = it.kind {
@@ -398,18 +833,55 @@ fn hit(x: i32, y: i32) -> Option<(usize, i32)> {
 }
 
 fn click(x: i32, y: i32) {
-    let Some((i, seg)) = hit(x, y) else { return };
+    let hit = hit(x, y);
     let (items, _, _) = layout(&crate::settings_snapshot());
-    let id = match items[i].kind {
-        Kind::Toggle(id, _) => id,
-        Kind::Button(id, ..) => id,
-        Kind::Seg(png, webp, _) => {
+    let kind = hit.and_then(|(i, _)| items.get(i)).map(|it| it.kind.clone());
+    // Any click ends a recording; clicking the recorded chip again just cancels.
+    if let Some(r) = st(|s| s.rec.clone()) {
+        rec_end();
+        let same = match kind {
+            Some(Kind::Chip(a, i, _)) => r.action == a && r.index == Some(i),
+            Some(Kind::Add(a)) => r.action == a && r.index.is_none(),
+            _ => false,
+        };
+        if same {
+            return;
+        }
+    }
+    st(|s| s.note = None);
+    let Some((_, seg)) = hit else {
+        refresh();
+        return;
+    };
+    let id = match kind {
+        Some(Kind::Toggle(id, _)) => id,
+        Some(Kind::Button(id, ..)) => id,
+        Some(Kind::Seg(png, webp, _)) => {
             if seg == 0 {
                 png
             } else {
                 webp
             }
         }
+        Some(Kind::Chip(a, i, _)) => {
+            rec_begin(a, Some(i));
+            return;
+        }
+        Some(Kind::Add(a)) => {
+            rec_begin(a, None);
+            return;
+        }
+        Some(Kind::Remove(a, i)) => {
+            remove_key(a, i);
+            refresh();
+            return;
+        }
+        Some(Kind::ResetKeys(_)) => {
+            reset_keys();
+            refresh();
+            return;
+        }
+        None => return,
     };
     crate::menu_action(id);
     refresh();
@@ -526,10 +998,43 @@ unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             LRESULT(0)
         }
         WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => {
-            let _ = DestroyWindow(h);
+            if st(|s| s.rec.is_some()) {
+                rec_end();
+            } else {
+                let _ = DestroyWindow(h);
+            }
+            LRESULT(0)
+        }
+        hotkey::WM_APP_KEY_RECORDED => {
+            on_recorded(Combo::unpack(wp.0));
+            LRESULT(0)
+        }
+        hotkey::WM_APP_KEY_MODS => {
+            st(|s| {
+                if let Some(r) = s.rec.as_mut() {
+                    r.mods = Combo::unpack(wp.0);
+                    r.since = std::time::Instant::now();
+                }
+            });
+            refresh();
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TIMER_REC => {
+            let stale = st(|s| {
+                s.rec
+                    .as_ref()
+                    .is_some_and(|r| r.since.elapsed().as_secs() >= REC_TIMEOUT_S)
+            });
+            if stale {
+                rec_end();
+            }
             LRESULT(0)
         }
         WM_ACTIVATE => {
+            if wp.0 & 0xFFFF == 0 {
+                // WA_INACTIVE: another window took the keyboard.
+                rec_end();
+            }
             // Settings may have been changed elsewhere (tray, config.json).
             refresh();
             LRESULT(0)
@@ -542,6 +1047,7 @@ unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             LRESULT(0)
         }
         WM_DESTROY => {
+            rec_end();
             st(|s| {
                 s.hwnd = None;
                 s.hover = None;
@@ -550,4 +1056,33 @@ unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         }
         _ => DefWindowProcW(h, msg, wp, lp),
     }
+}
+
+/// Pictures of the window without showing it (--ui-shots): as it opens, and
+/// while a shortcut is recorded. `k` is the display scale.
+pub fn render_png(dir: &std::path::Path, k: f32) -> Result<(), String> {
+    let (w, h) = ((W * k) as i32, (H * k) as i32);
+    st(|s| s.k = k);
+    let shots = [
+        ("settings.png", None),
+        (
+            "settings-recording.png",
+            Some(Rec {
+                action: Action::Scroll,
+                index: None,
+                mods: Combo::unpack(Combo { ctrl: true, alt: false, shift: true, win: false, vk: 0 }.pack()),
+                since: std::time::Instant::now(),
+            }),
+        ),
+    ];
+    for (name, rec) in shots {
+        st(|s| s.rec = rec);
+        let px = paint_offscreen(w, h, |dc, rc| unsafe { draw(dc, rc) })
+            .ok_or("could not draw the settings window")?;
+        let img = crate::encode::Image { w: w as u32, h: h as u32, bgra: px };
+        let data = crate::encode::png(&img, 0)?;
+        std::fs::write(dir.join(name), data).map_err(|e| e.to_string())?;
+    }
+    st(|s| s.rec = None);
+    Ok(())
 }
